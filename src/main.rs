@@ -9,7 +9,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("dx_ai_tool=debug".parse().unwrap()),
+                .add_directive("rocky=debug".parse().unwrap()),
         )
         .init();
 
