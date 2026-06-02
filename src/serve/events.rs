@@ -19,7 +19,7 @@ impl DiagnosticLevel {
 }
 
 /// A single rustc diagnostic parsed from `dx serve` stderr
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RustcDiagnostic {
     pub level: DiagnosticLevel,
     /// e.g. "E0502" — None for bare `error:` without a code

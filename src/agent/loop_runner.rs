@@ -1,7 +1,7 @@
 use crate::agent::client::AnthropicClient;
 use crate::agent::context::{ContentBlock, ConversationContext};
 use crate::fs;
-use crate::state::chat::{ChatMessage, ToolCall};
+use crate::state::chat::ToolCall;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 

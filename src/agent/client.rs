@@ -1,4 +1,4 @@
-use crate::agent::context::{ApiMessage, ConversationContext};
+use crate::agent::context::ConversationContext;
 use crate::agent::tools::tool_definitions;
 use anyhow::Result;
 use serde_json::{json, Value};

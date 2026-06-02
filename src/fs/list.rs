@@ -13,7 +13,7 @@ fn list_recursive<'a>(
     dir: &'a Path,
     root: &'a Path,
     result: &'a mut Vec<String>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let mut entries = tokio::fs::read_dir(dir).await?;
         while let Some(entry) = entries.next_entry().await? {

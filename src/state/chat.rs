@@ -11,7 +11,7 @@ pub enum MessageRole {
 }
 
 /// A single tool call the agent made — stored for display in UI
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub name: String,
     /// e.g. the file path that was read/written
@@ -19,7 +19,7 @@ pub struct ToolCall {
 }
 
 /// A single message in the conversation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     pub id: u64,
     pub role: MessageRole,
