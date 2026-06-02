@@ -67,6 +67,7 @@ fn spawn_build_event_loop(
 ) {
     spawn(async move {
         let mut pending_diagnostics = vec![];
+        let mut browser_opened = false;
 
         while let Some(event) = event_rx.recv().await {
             match event {
@@ -80,6 +81,13 @@ fn spawn_build_event_loop(
                     pending_diagnostics.clear();
                     session.write().on_build_success();
                     chat.write().push(ChatMessage::system("✓ Build succeeded".to_string()));
+
+                    if !browser_opened {
+                        browser_opened = true;
+                        if let Err(e) = open::that_detached("http://localhost:8080") {
+                            tracing::warn!("Failed to open browser: {}", e);
+                        }
+                    }
                 }
 
                 BuildEvent::DiagnosticEmitted(diag) => {
