@@ -2,6 +2,7 @@ use crate::agent::client::{Provider, ProviderConfig};
 use crate::app::start_project;
 use crate::state::chat::ChatState;
 use crate::state::session::SessionState;
+use dioxus::desktop::use_window;
 use dioxus::prelude::*;
 
 #[component]
@@ -10,18 +11,30 @@ pub fn ProjectPicker() -> Element {
     let chat = use_context::<Signal<ChatState>>();
     let mut config = use_context::<Signal<ProviderConfig>>();
     let mut picking = use_signal(|| false);
+    // Captured in the closure so we can minimize Rocky before the dialog
+    // opens — this ensures the native folder picker appears in the foreground
+    // rather than behind the Dioxus WebView window.
+    let win = use_window();
 
     let on_pick = move |_| {
         picking.set(true);
         let session = session.clone();
         let chat = chat.clone();
         let cfg = config.read().clone();
+        let win = win.clone();
 
         spawn(async move {
+            // Step aside so the OS dialog gets focus
+            win.set_minimized(true);
+
             let folder = rfd::AsyncFileDialog::new()
                 .set_title("Select your Dioxus project folder")
                 .pick_folder()
                 .await;
+
+            // Restore Rocky whether or not the user picked a folder
+            win.set_minimized(false);
+            win.set_focus();
 
             if let Some(folder) = folder {
                 let path = folder.path().to_path_buf();
@@ -36,7 +49,6 @@ pub fn ProjectPicker() -> Element {
     let active_key = config.read().active_key().to_string();
     let key_missing = active_key.is_empty();
 
-    // Pre-compute button styles to avoid nested quotes inside RSX strings
     let (anthro_bg, anthro_border, anthro_color) = if is_anthropic {
         ("#f97316", "#f97316", "white")
     } else {
