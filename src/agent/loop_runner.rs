@@ -1,4 +1,4 @@
-use crate::agent::client::AnthropicClient;
+use crate::agent::client::ModelClient;
 use crate::agent::context::{ContentBlock, ConversationContext};
 use crate::fs;
 use crate::state::chat::ToolCall;
@@ -23,7 +23,7 @@ pub enum AgentEvent {
 /// Run one agent turn.
 /// Sends events back over `tx` as the turn progresses.
 pub async fn run_turn(
-    client: &AnthropicClient,
+    client: &ModelClient,
     context: &mut ConversationContext,
     project_root: PathBuf,
     tx: mpsc::Sender<AgentEvent>,

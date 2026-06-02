@@ -1,7 +1,6 @@
-use crate::agent::client::AnthropicClient;
+use crate::agent::client::{ModelClient, ProviderConfig};
 use crate::agent::context::ConversationContext;
 use crate::agent::loop_runner::{run_turn, AgentEvent};
-use crate::app::ApiKey;
 use crate::state::chat::{ChatMessage, ChatState, MessageRole};
 use crate::state::session::SessionState;
 use dioxus::prelude::*;
@@ -11,7 +10,7 @@ use std::path::PathBuf;
 pub fn ChatPanel() -> Element {
     let session = use_context::<Signal<SessionState>>();
     let mut chat = use_context::<Signal<ChatState>>();
-    let api_key_signal = use_context::<Signal<ApiKey>>();
+    let config_signal = use_context::<Signal<ProviderConfig>>();
     let mut input = use_signal(|| String::new());
 
     let mut on_send = move |_| {
@@ -23,7 +22,7 @@ pub fn ChatPanel() -> Element {
         input.set(String::new());
         chat.write().push(ChatMessage::user(text.clone()));
 
-        let api_key = api_key_signal.read().0.clone();
+        let config = config_signal.read().clone();
         let project_path = session
             .read()
             .project_path
@@ -35,7 +34,7 @@ pub fn ChatPanel() -> Element {
         spawn(async move {
             chat_clone.write().agent_running = true;
 
-            let client = AnthropicClient::new(api_key);
+            let client = ModelClient::new(&config);
             let mut context = ConversationContext::default();
 
             // Replay history into context
