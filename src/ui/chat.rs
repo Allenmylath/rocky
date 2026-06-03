@@ -12,6 +12,8 @@ pub fn ChatPanel() -> Element {
     let mut chat = use_context::<Signal<ChatState>>();
     let config_signal = use_context::<Signal<ProviderConfig>>();
     let mut input = use_signal(|| String::new());
+    // Bolt pattern: store abort handle so Stop button can cancel mid-run
+    let mut abort_handle: Signal<Option<tokio::task::AbortHandle>> = use_signal(|| None);
 
     let mut on_send = move |_| {
         let text = input.read().trim().to_string();
@@ -37,7 +39,6 @@ pub fn ChatPanel() -> Element {
             let client = ModelClient::new(&config);
             let mut context = ConversationContext::default();
 
-            // Replay history into context
             for msg in chat_clone.read().to_api_messages() {
                 match msg.role.as_str() {
                     "user" => context.push_user(msg.content),
@@ -51,15 +52,22 @@ pub fn ChatPanel() -> Element {
             let agent_task = tokio::spawn(async move {
                 let _ = run_turn(&client, &mut context, project_path, agent_tx).await;
             });
+            abort_handle.set(Some(agent_task.abort_handle()));
 
             let mut assistant_text = String::new();
             let mut tool_calls = vec![];
+            let mut written_files: Vec<String> = vec![];
 
             while let Some(event) = agent_rx.recv().await {
                 match event {
                     AgentEvent::AssistantText(t) => assistant_text.push_str(&t),
-                    AgentEvent::ToolCalled(tc) => tool_calls.push(tc),
+                    AgentEvent::ToolCalled(tc) => {
+                        chat_clone.write().current_action =
+                            Some(format!("{}: {}", tc.name, tc.summary));
+                        tool_calls.push(tc);
+                    }
                     AgentEvent::FileWritten(path) => {
+                        written_files.push(path.clone());
                         chat_clone.write().last_touched_files.push(path);
                     }
                     AgentEvent::TurnComplete => {
@@ -68,6 +76,17 @@ pub fn ChatPanel() -> Element {
                                 assistant_text.clone(),
                                 tool_calls.clone(),
                             ));
+                        }
+                        if !written_files.is_empty() {
+                            let mut summary = format!(
+                                "Done. {} file{} written:\n",
+                                written_files.len(),
+                                if written_files.len() == 1 { "" } else { "s" }
+                            );
+                            for f in &written_files {
+                                summary.push_str(&format!("  • {}\n", f));
+                            }
+                            chat_clone.write().push(ChatMessage::system(summary));
                         }
                         break;
                     }
@@ -81,8 +100,19 @@ pub fn ChatPanel() -> Element {
             }
 
             let _ = agent_task.await;
+            abort_handle.set(None);
+            chat_clone.write().current_action = None;
             chat_clone.write().agent_running = false;
         });
+    };
+
+    // Bolt pattern: Stop cancels the running agent task immediately
+    let on_stop = move |_| {
+        if let Some(handle) = abort_handle.write().take() {
+            handle.abort();
+        }
+        chat.write().agent_running = false;
+        chat.write().current_action = None;
     };
 
     let on_keydown = move |evt: KeyboardEvent| {
@@ -90,6 +120,9 @@ pub fn ChatPanel() -> Element {
             on_send(());
         }
     };
+
+    let agent_running = chat.read().agent_running;
+    let current_action = chat.read().current_action.clone();
 
     rsx! {
         div {
@@ -101,15 +134,24 @@ pub fn ChatPanel() -> Element {
                 for msg in chat.read().messages.iter() {
                     MessageBubble { message: msg.clone() }
                 }
-                if chat.read().agent_running {
+                if agent_running {
                     div {
-                        style: "color: #888; font-size: 12px; font-style: italic;",
-                        "Agent is working..."
+                        style: "display: flex; flex-direction: column; gap: 4px;",
+                        div {
+                            style: "color: #f97316; font-size: 12px; font-style: italic;",
+                            "Rocky is working..."
+                        }
+                        if let Some(action) = &current_action {
+                            div {
+                                style: "color: #666; font-size: 11px; font-family: monospace;",
+                                "⚙ {action}"
+                            }
+                        }
                     }
                 }
             }
 
-            // Input area
+            // Input area — textarea always editable (Bolt pattern)
             div {
                 style: "padding: 12px; border-top: 1px solid #333; display: flex; gap: 8px;",
                 textarea {
@@ -126,26 +168,44 @@ pub fn ChatPanel() -> Element {
                         outline: none;
                     ",
                     rows: "3",
-                    placeholder: "Describe what you want to build... (Enter to send)",
+                    placeholder: "Describe what you want to build... (Enter to send, Shift+Enter for newline)",
                     value: "{input}",
                     oninput: move |evt| input.set(evt.value()),
                     onkeydown: on_keydown,
                 }
-                button {
-                    style: "
-                        background: #f97316;
-                        color: white;
-                        border: none;
-                        padding: 8px 16px;
-                        border-radius: 6px;
-                        font-family: monospace;
-                        font-size: 13px;
-                        cursor: pointer;
-                        align-self: flex-end;
-                    ",
-                    disabled: chat.read().agent_running,
-                    onclick: move |_| on_send(()),
-                    "Send"
+                // Bolt pattern: Send ↔ Stop swap
+                if agent_running {
+                    button {
+                        style: "
+                            background: #ef4444;
+                            color: white;
+                            border: none;
+                            padding: 8px 16px;
+                            border-radius: 6px;
+                            font-family: monospace;
+                            font-size: 13px;
+                            cursor: pointer;
+                            align-self: flex-end;
+                        ",
+                        onclick: on_stop,
+                        "Stop"
+                    }
+                } else {
+                    button {
+                        style: "
+                            background: #f97316;
+                            color: white;
+                            border: none;
+                            padding: 8px 16px;
+                            border-radius: 6px;
+                            font-family: monospace;
+                            font-size: 13px;
+                            cursor: pointer;
+                            align-self: flex-end;
+                        ",
+                        onclick: move |_| on_send(()),
+                        "Send"
+                    }
                 }
             }
         }
@@ -171,13 +231,12 @@ fn MessageBubble(message: ChatMessage) -> Element {
                 style: "color: {color}; font-size: 13px; white-space: pre-wrap; word-break: break-word;",
                 "{message.content}"
             }
-            // Tool calls
             if !message.tool_calls.is_empty() {
                 div {
                     style: "margin-top: 8px; display: flex; flex-direction: column; gap: 4px;",
                     for tc in message.tool_calls.iter() {
                         div {
-                            style: "font-size: 11px; color: #666; font-family: monospace;",
+                            style: "font-size: 11px; color: #555; font-family: monospace;",
                             "⚙ {tc.name}({tc.summary})"
                         }
                     }

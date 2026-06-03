@@ -1,6 +1,6 @@
 use crate::state::session::SessionState;
 use crate::ui::chat::ChatPanel;
-use crate::ui::diagnostics::{AutoFixBanner, DiagnosticsPanel};
+use crate::ui::diagnostics::{AutoFixBanner, BuildLogPanel, DiagnosticsPanel};
 use crate::ui::project_picker::ProjectPicker;
 use dioxus::prelude::*;
 
@@ -42,10 +42,11 @@ pub fn Root() -> Element {
                         ChatPanel {}
                     }
 
-                    // Right: diagnostics
+                    // Right: diagnostics + raw log
                     div {
-                        style: "width: 380px; overflow-y: auto;",
+                        style: "width: 380px; overflow-y: auto; display: flex; flex-direction: column;",
                         DiagnosticsPanel {}
+                        BuildLogPanel {}
                     }
                 }
             }

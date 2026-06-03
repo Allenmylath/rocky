@@ -1,6 +1,61 @@
 use crate::state::session::{AutoFixState, BuildStatus, SessionState};
 use dioxus::prelude::*;
 
+/// Scrollable raw dx serve log panel
+#[component]
+pub fn BuildLogPanel() -> Element {
+    let session = use_context::<Signal<SessionState>>();
+    let mut expanded = use_signal(|| false);
+
+    let log = session.read().raw_log.clone();
+    let label = if *expanded.read() { "▾ dx serve log" } else { "▸ dx serve log" };
+
+    rsx! {
+        div {
+            style: "border-top: 1px solid #2a2a2a; margin-top: 8px;",
+
+            // Toggle header
+            div {
+                style: "
+                    padding: 6px 12px;
+                    font-size: 11px;
+                    color: #555;
+                    cursor: pointer;
+                    user-select: none;
+                    text-transform: uppercase;
+                    letter-spacing: 0.05em;
+                ",
+                onclick: move |_| {
+                    let cur = *expanded.read();
+                    expanded.set(!cur);
+                },
+                "{label} ({log.len()} lines)"
+            }
+
+            if *expanded.read() {
+                div {
+                    style: "
+                        max-height: 300px;
+                        overflow-y: auto;
+                        background: #0d0d0d;
+                        padding: 8px 12px;
+                        font-family: monospace;
+                        font-size: 11px;
+                        color: #666;
+                    ",
+                    if log.is_empty() {
+                        div { "No output yet." }
+                    } else {
+                        for line in log.iter() {
+                            div { style: "white-space: pre-wrap; word-break: break-all;", "{line}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Shows the auto-fix countdown banner when a build fails
 #[component]
 pub fn AutoFixBanner() -> Element {

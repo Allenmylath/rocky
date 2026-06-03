@@ -17,9 +17,19 @@ pub fn run() {
 
 #[component]
 pub fn App() -> Element {
-    use_context_provider(|| Signal::new(SessionState::default()));
-    use_context_provider(|| Signal::new(ChatState::default()));
-    use_context_provider(|| Signal::new(ProviderConfig::default()));
+    let session = use_context_provider(|| Signal::new(SessionState::default()));
+    let chat = use_context_provider(|| Signal::new(ChatState::default()));
+    let config_sig = use_context_provider(|| Signal::new(ProviderConfig::default()));
+
+    // Auto-reopen the last project on launch
+    use_effect(move || {
+        let config = config_sig.read().clone();
+        spawn(async move {
+            if let Some(path) = crate::config::load_last_project() {
+                start_project(path, session, chat, config).await;
+            }
+        });
+    });
 
     rsx! { Root {} }
 }
@@ -35,6 +45,8 @@ pub async fn start_project(
 ) {
     session.write().project_path = Some(project_path.clone());
     session.write().serve_running = true;
+
+    crate::config::save_last_project(&project_path);
 
     chat.write().push(ChatMessage::system(format!(
         "Opened project: {}",
@@ -124,6 +136,7 @@ fn spawn_build_event_loop(
 
                 BuildEvent::StdoutLine(line) => {
                     tracing::trace!("dx serve: {}", line);
+                    session.write().push_log(line);
                 }
             }
         }

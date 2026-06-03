@@ -90,6 +90,8 @@ pub struct ChatState {
     pub last_touched_files: Vec<String>,
     /// Whether the agent is currently running
     pub agent_running: bool,
+    /// Live status shown while agent is running, e.g. "write_file: src/components/crm.rs"
+    pub current_action: Option<String>,
 }
 
 impl ChatState {

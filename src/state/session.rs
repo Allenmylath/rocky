@@ -49,6 +49,8 @@ pub struct SessionState {
     pub auto_fix: AutoFixState,
     pub serve_running: bool,
     pub auto_fix_iterations: u8,
+    /// Raw lines from dx serve — last 200 kept for the log panel
+    pub raw_log: Vec<String>,
 }
 
 pub const MAX_AUTO_FIX_ITERATIONS: u8 = 5;
@@ -62,6 +64,7 @@ impl Default for SessionState {
             auto_fix: AutoFixState::Idle,
             serve_running: false,
             auto_fix_iterations: 0,
+            raw_log: Vec::new(),
         }
     }
 }
@@ -94,6 +97,13 @@ impl SessionState {
 
     pub fn stop_auto_fix(&mut self) {
         self.auto_fix = AutoFixState::Stopped;
+    }
+
+    pub fn push_log(&mut self, line: String) {
+        self.raw_log.push(line);
+        if self.raw_log.len() > 200 {
+            self.raw_log.remove(0);
+        }
     }
 
     pub fn tick_countdown(&mut self) -> bool {

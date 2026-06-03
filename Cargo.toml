@@ -27,6 +27,9 @@ open = "5"
 # Voice AI — STT / LLM / TTS / Dhara pipelines
 rustvani = "0.2.1"
 
+# .env file loading
+dotenvy = "0.15"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

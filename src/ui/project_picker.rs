@@ -37,7 +37,7 @@ pub fn ProjectPicker() -> Element {
             win.set_focus();
 
             if let Some(folder) = folder {
-                let path = folder.path().to_path_buf();
+                let path = crate::config::find_project_root(&folder.path().to_path_buf());
                 start_project(path, session, chat, cfg).await;
             }
 
