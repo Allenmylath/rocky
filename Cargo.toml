@@ -30,6 +30,9 @@ rustvani = "0.2.1"
 # .env file loading
 dotenvy = "0.15"
 
+# LLM agent framework — unified OpenAI, Anthropic, and 20+ providers
+rig-core = "0.38"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
