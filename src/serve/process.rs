@@ -62,56 +62,47 @@ impl ServeHandle {
     }
 }
 
-/// Read stdout and stderr concurrently, parse each line, send events
+/// Read stdout and stderr concurrently, parse each line, send events.
+/// Uses a merge channel so EOF on stdout doesn't kill stderr reading.
 async fn read_output(
     stdout: tokio::process::ChildStdout,
     stderr: tokio::process::ChildStderr,
     tx: mpsc::Sender<BuildEvent>,
 ) {
-    let mut stdout_reader = BufReader::new(stdout).lines();
-    let mut stderr_reader = BufReader::new(stderr).lines();
+    let (line_tx, mut line_rx) = mpsc::channel::<String>(256);
 
-    // dx serve writes diagnostics to stderr and status to stdout
-    // We read both concurrently and merge into the same parser
-    // since dx mixes them based on version/platform
-    let mut parser = StderrParser::new();
-
-    loop {
-        tokio::select! {
-            // stdout line
-            line = stdout_reader.next_line() => {
-                match line {
-                    Ok(Some(l)) => {
-                        let events = parser.feed_line(&l);
-                        for event in events {
-                            if tx.send(event).await.is_err() {
-                                return; // receiver dropped
-                            }
-                        }
-                    }
-                    Ok(None) => break, // EOF
-                    Err(_) => break,
-                }
+    // stdout reader — drops its sender on EOF
+    let lt1 = line_tx.clone();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            if lt1.send(l).await.is_err() {
+                break;
             }
-            // stderr line
-            line = stderr_reader.next_line() => {
-                match line {
-                    Ok(Some(l)) => {
-                        let events = parser.feed_line(&l);
-                        for event in events {
-                            if tx.send(event).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
+        }
+    });
+
+    // stderr reader — drops its sender on EOF
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            if line_tx.send(l).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Process merged lines; loop ends when both senders are dropped
+    let mut parser = StderrParser::new();
+    while let Some(line) = line_rx.recv().await {
+        let events = parser.feed_line(&line);
+        for event in events {
+            if tx.send(event).await.is_err() {
+                return;
             }
         }
     }
 
-    // Flush any in-progress diagnostic at EOF
     for event in parser.flush() {
         let _ = tx.send(event).await;
     }

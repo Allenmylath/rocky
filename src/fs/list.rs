@@ -1,11 +1,22 @@
 use std::path::Path;
 
-/// List all .rs files in the project's src/ directory recursively.
+/// List all .rs files in the project's src/ directory, plus key root-level files.
 /// Returns paths relative to the project root.
 pub async fn list_src_files(project_root: &Path) -> anyhow::Result<Vec<String>> {
-    let src_path = project_root.join("src");
     let mut result = vec![];
-    list_recursive(&src_path, project_root, &mut result).await?;
+
+    // Include root-level config files if they exist
+    for name in &["Cargo.toml", "Dioxus.toml", "Cargo.lock", "AGENTS.md"] {
+        if project_root.join(name).exists() {
+            result.push(name.to_string());
+        }
+    }
+
+    let src_path = project_root.join("src");
+    if src_path.exists() {
+        list_recursive(&src_path, project_root, &mut result).await?;
+    }
+
     Ok(result)
 }
 

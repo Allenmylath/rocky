@@ -1,7 +1,7 @@
 use crate::agent::client::{ModelClient, ProviderConfig};
 use crate::agent::context::ConversationContext;
 use crate::agent::loop_runner::{run_turn, AgentEvent};
-use crate::state::chat::{ChatMessage, ChatState, MessageRole};
+use crate::state::chat::{ChatMessage, ChatState, MessageRole, StepKind, StepStatus, WorkflowStep};
 use crate::state::session::SessionState;
 use dioxus::prelude::*;
 use std::path::PathBuf;
@@ -12,7 +12,6 @@ pub fn ChatPanel() -> Element {
     let mut chat = use_context::<Signal<ChatState>>();
     let config_signal = use_context::<Signal<ProviderConfig>>();
     let mut input = use_signal(|| String::new());
-    // Bolt pattern: store abort handle so Stop button can cancel mid-run
     let mut abort_handle: Signal<Option<tokio::task::AbortHandle>> = use_signal(|| None);
 
     let mut on_send = move |_| {
@@ -35,6 +34,13 @@ pub fn ChatPanel() -> Element {
 
         spawn(async move {
             chat_clone.write().agent_running = true;
+
+            let short = if text.len() > 32 {
+                format!("{}...", &text[..32])
+            } else {
+                text.clone()
+            };
+            chat_clone.write().begin_turn(short);
 
             let client = ModelClient::new(&config);
             let mut context = ConversationContext::default();
@@ -61,15 +67,27 @@ pub fn ChatPanel() -> Element {
             while let Some(event) = agent_rx.recv().await {
                 match event {
                     AgentEvent::AssistantText(t) => assistant_text.push_str(&t),
+
+                    AgentEvent::ActionStarted(name, summary) => {
+                        let kind = match name.as_str() {
+                            "read_file" => StepKind::ReadFile,
+                            "write_file" => StepKind::WriteFile,
+                            "list_files" => StepKind::ListFiles,
+                            _ => StepKind::Build,
+                        };
+                        chat_clone.write().push_step(WorkflowStep::new(kind, &summary));
+                    }
+
                     AgentEvent::ToolCalled(tc) => {
-                        chat_clone.write().current_action =
-                            Some(format!("{}: {}", tc.name, tc.summary));
+                        chat_clone.write().complete_last_step();
                         tool_calls.push(tc);
                     }
+
                     AgentEvent::FileWritten(path) => {
                         written_files.push(path.clone());
                         chat_clone.write().last_touched_files.push(path);
                     }
+
                     AgentEvent::TurnComplete => {
                         if !assistant_text.is_empty() || !tool_calls.is_empty() {
                             chat_clone.write().push(ChatMessage::assistant(
@@ -88,12 +106,15 @@ pub fn ChatPanel() -> Element {
                             }
                             chat_clone.write().push(ChatMessage::system(summary));
                         }
+                        chat_clone.write().finish_turn(StepStatus::Complete);
                         break;
                     }
+
                     AgentEvent::Error(e) => {
                         chat_clone
                             .write()
                             .push(ChatMessage::system(format!("Error: {}", e)));
+                        chat_clone.write().finish_turn(StepStatus::Failed);
                         break;
                     }
                 }
@@ -101,18 +122,16 @@ pub fn ChatPanel() -> Element {
 
             let _ = agent_task.await;
             abort_handle.set(None);
-            chat_clone.write().current_action = None;
             chat_clone.write().agent_running = false;
         });
     };
 
-    // Bolt pattern: Stop cancels the running agent task immediately
     let on_stop = move |_| {
         if let Some(handle) = abort_handle.write().take() {
             handle.abort();
         }
+        chat.write().finish_turn(StepStatus::Failed);
         chat.write().agent_running = false;
-        chat.write().current_action = None;
     };
 
     let on_keydown = move |evt: KeyboardEvent| {
@@ -122,36 +141,31 @@ pub fn ChatPanel() -> Element {
     };
 
     let agent_running = chat.read().agent_running;
-    let current_action = chat.read().current_action.clone();
 
     rsx! {
         div {
             style: "flex: 1; display: flex; flex-direction: column; overflow: hidden;",
 
-            // Message list
             div {
-                style: "flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px;",
+                style: "
+                    flex: 1;
+                    overflow-y: auto;
+                    padding: 16px;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 12px;
+                ",
                 for msg in chat.read().messages.iter() {
                     MessageBubble { message: msg.clone() }
                 }
                 if agent_running {
                     div {
-                        style: "display: flex; flex-direction: column; gap: 4px;",
-                        div {
-                            style: "color: #f97316; font-size: 12px; font-style: italic;",
-                            "Rocky is working..."
-                        }
-                        if let Some(action) = &current_action {
-                            div {
-                                style: "color: #666; font-size: 11px; font-family: monospace;",
-                                "⚙ {action}"
-                            }
-                        }
+                        style: "color: #f97316; font-size: 12px; font-style: italic; padding: 4px 0;",
+                        "Rocky is working..."
                     }
                 }
             }
 
-            // Input area — textarea always editable (Bolt pattern)
             div {
                 style: "padding: 12px; border-top: 1px solid #333; display: flex; gap: 8px;",
                 textarea {
@@ -173,7 +187,6 @@ pub fn ChatPanel() -> Element {
                     oninput: move |evt| input.set(evt.value()),
                     onkeydown: on_keydown,
                 }
-                // Bolt pattern: Send ↔ Stop swap
                 if agent_running {
                     button {
                         style: "
@@ -230,17 +243,6 @@ fn MessageBubble(message: ChatMessage) -> Element {
             div {
                 style: "color: {color}; font-size: 13px; white-space: pre-wrap; word-break: break-word;",
                 "{message.content}"
-            }
-            if !message.tool_calls.is_empty() {
-                div {
-                    style: "margin-top: 8px; display: flex; flex-direction: column; gap: 4px;",
-                    for tc in message.tool_calls.iter() {
-                        div {
-                            style: "font-size: 11px; color: #555; font-family: monospace;",
-                            "⚙ {tc.name}({tc.summary})"
-                        }
-                    }
-                }
             }
         }
     }

@@ -45,11 +45,15 @@ impl ProviderConfig {
 
 impl Default for ProviderConfig {
     fn default() -> Self {
-        Self {
-            provider: Provider::Anthropic,
-            anthropic_key: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-            openai_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-        }
+        let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        // Prefer Anthropic if both are set; fall back to OpenAI if only that is available.
+        let provider = if !anthropic_key.is_empty() {
+            Provider::Anthropic
+        } else {
+            Provider::OpenAi
+        };
+        Self { provider, anthropic_key, openai_key }
     }
 }
 

@@ -102,4 +102,8 @@ pub enum BuildEvent {
 
     /// Raw stdout line — for showing dx serve output verbatim if needed
     StdoutLine(String),
+
+    /// dx serve encountered a fatal setup error (e.g. missing Cargo.toml)
+    /// Carries a user-friendly message with a suggested fix.
+    FatalError(String),
 }

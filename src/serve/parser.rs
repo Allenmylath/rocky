@@ -57,6 +57,9 @@ fn parse_prefix(raw: &str) -> PrefixedLine<'_> {
     } else if let Some(pos) = clean.find("INFO") {
         let rest = clean[pos + 4..].trim_start().to_string();
         (LineTag::Dev, rest)
+    } else if let Some(pos) = clean.find("ERROR") {
+        let rest = clean[pos + 5..].trim_start().to_string();
+        (LineTag::Dev, rest)
     } else {
         (LineTag::Other, clean)
     };
@@ -183,12 +186,12 @@ enum ParserState {
 /// multi-line diagnostic blocks from `dx serve` stderr output
 pub struct StderrParser {
     state: ParserState,
-    /// The diagnostic being built
     current_diag: Option<PartialDiagnostic>,
-    /// Which target we're currently seeing output from
     current_target: BuildTarget,
-    /// Pending events to emit (we may emit multiple per line)
     pending: Vec<BuildEvent>,
+    /// Last non-lifecycle error message seen (used as fallback diagnostic when
+    /// BuildFailed fires without any cargo-format diagnostics, e.g. WASM config errors)
+    last_error_msg: Option<String>,
 }
 
 struct PartialDiagnostic {
@@ -224,12 +227,19 @@ impl StderrParser {
             current_diag: None,
             current_target: BuildTarget::Unknown,
             pending: vec![],
+            last_error_msg: None,
         }
     }
 
     /// Feed one line of dx serve output — returns zero or more events
     pub fn feed_line(&mut self, raw: &str) -> Vec<BuildEvent> {
         let mut events = vec![];
+
+        // Always forward every non-empty line to the raw log panel
+        if !raw.trim().is_empty() {
+            events.push(BuildEvent::StdoutLine(raw.to_string()));
+        }
+
         let pl = parse_prefix(raw);
 
         match pl.tag {
@@ -240,7 +250,6 @@ impl StderrParser {
                 self.handle_cargo_line(&pl.content, &mut events);
             }
             LineTag::Other => {
-                // dx serve banner lines (the INFO block) — check for success
                 if pl.content.contains("Serving your app") {
                     self.flush_current_diag(&mut events);
                     events.push(BuildEvent::BuildSuccess);
@@ -261,17 +270,36 @@ impl StderrParser {
             self.current_target = BuildTarget::Unknown;
         } else if content.contains("Build failed") {
             self.flush_current_diag(events);
+            // If no cargo-format diagnostics were captured (e.g. WASM config errors
+            // that dx emits as plain ERROR lines), synthesize one from the last
+            // error message we saw so the user sees something useful.
+            if let Some(msg) = self.last_error_msg.take() {
+                events.push(BuildEvent::DiagnosticEmitted(RustcDiagnostic {
+                    level: DiagnosticLevel::Error,
+                    code: None,
+                    message: msg,
+                    file: String::new(),
+                    line: 0,
+                    col: 0,
+                    snippet: vec![],
+                    target: self.current_target.clone(),
+                }));
+            }
             events.push(BuildEvent::BuildFailed);
             self.state = ParserState::Idle;
         } else if content.contains("Compiling") || content.contains("Rebuilding") {
-            // New build cycle starting — reset state
             self.flush_current_diag(events);
+            self.last_error_msg = None;
             events.push(BuildEvent::BuildStarted);
             self.state = ParserState::Idle;
+        } else if content.contains("cargo metadata") {
+            events.push(BuildEvent::FatalError(content.to_string()));
+        } else if !content.is_empty() {
+            // Save non-lifecycle dev/error lines as a fallback message.
+            // These capture things like "the wasm*-unknown-unknown targets are
+            // not supported by default, you may need to enable the 'js' feature"
+            self.last_error_msg = Some(content.to_string());
         }
-
-        // Pass raw dev lines through as stdout for the UI log panel
-        events.push(BuildEvent::StdoutLine(content.to_string()));
     }
 
     fn handle_cargo_line(&mut self, content: &str, events: &mut Vec<BuildEvent>) {

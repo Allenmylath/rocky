@@ -1,32 +1,158 @@
 use crate::serve::events::RustcDiagnostic;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Who sent this message
 #[derive(Debug, Clone, PartialEq)]
 pub enum MessageRole {
     User,
     Assistant,
-    /// System-generated — e.g. "Build failed with 3 errors, auto-fixing..."
     System,
 }
 
-/// A single tool call the agent made — stored for display in UI
+// ── Workflow tracking ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepStatus {
+    Pending,
+    Running,
+    Complete,
+    Failed,
+}
+
+impl StepStatus {
+    pub fn icon(&self) -> &'static str {
+        match self {
+            StepStatus::Pending => "○",
+            StepStatus::Running => "⏳",
+            StepStatus::Complete => "✓",
+            StepStatus::Failed => "✗",
+        }
+    }
+
+    pub fn color(&self) -> &'static str {
+        match self {
+            StepStatus::Pending => "#555",
+            StepStatus::Running => "#f97316",
+            StepStatus::Complete => "#22c55e",
+            StepStatus::Failed => "#ef4444",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepKind {
+    ReadFile,
+    WriteFile,
+    ListFiles,
+    Build,
+    AutoFix { iteration: u8 },
+}
+
+impl StepKind {
+    pub fn label(&self, summary: &str) -> String {
+        match self {
+            StepKind::ReadFile => format!("read  {}", summary),
+            StepKind::WriteFile => format!("write {}", summary),
+            StepKind::ListFiles => "list  src/".to_string(),
+            StepKind::Build => summary.to_string(),
+            StepKind::AutoFix { iteration } => {
+                format!("auto-fix {}/5 → {}", iteration, summary)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkflowStep {
+    pub kind: StepKind,
+    pub summary: String,
+    pub status: StepStatus,
+}
+
+impl WorkflowStep {
+    pub fn new(kind: StepKind, summary: impl Into<String>) -> Self {
+        Self {
+            kind,
+            summary: summary.into(),
+            status: StepStatus::Running,
+        }
+    }
+
+    pub fn build(msg: impl Into<String>) -> Self {
+        Self {
+            kind: StepKind::Build,
+            summary: msg.into(),
+            status: StepStatus::Running,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        self.kind.label(&self.summary)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkflowTurn {
+    pub id: u64,
+    pub title: String,
+    pub steps: Vec<WorkflowStep>,
+    pub status: StepStatus,
+    pub expanded: bool,
+}
+
+impl WorkflowTurn {
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            id: now_ms(),
+            title: title.into(),
+            steps: vec![],
+            status: StepStatus::Running,
+            expanded: true,
+        }
+    }
+
+    pub fn push_step(&mut self, step: WorkflowStep) {
+        self.steps.push(step);
+    }
+
+    pub fn complete_last_step(&mut self) {
+        for step in self.steps.iter_mut().rev() {
+            if step.status == StepStatus::Running {
+                step.status = StepStatus::Complete;
+                break;
+            }
+        }
+    }
+
+    pub fn finish(&mut self, status: StepStatus) {
+        for step in self.steps.iter_mut() {
+            if step.status == StepStatus::Running {
+                step.status = status.clone();
+            }
+        }
+        self.status = status;
+        if self.status == StepStatus::Complete {
+            self.expanded = false;
+        }
+    }
+}
+
+// ── ToolCall ─────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub name: String,
-    /// e.g. the file path that was read/written
     pub summary: String,
+    pub status: StepStatus,
 }
 
-/// A single message in the conversation
+// ── ChatMessage ───────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     pub id: u64,
     pub role: MessageRole,
     pub content: String,
-    /// Tool calls made during this assistant turn
     pub tool_calls: Vec<ToolCall>,
-    /// If this message was triggered by a build failure, attach the diagnostics
     pub triggered_by: Option<Vec<RustcDiagnostic>>,
     pub timestamp: u64,
 }
@@ -82,16 +208,15 @@ impl ChatMessage {
     }
 }
 
-/// The full conversation — this is what gets sent to Anthropic on each turn
+// ── ChatState ─────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Default)]
 pub struct ChatState {
     pub messages: Vec<ChatMessage>,
-    /// Files the agent touched in the last turn — used for context on next loop
     pub last_touched_files: Vec<String>,
-    /// Whether the agent is currently running
     pub agent_running: bool,
-    /// Live status shown while agent is running, e.g. "write_file: src/components/crm.rs"
-    pub current_action: Option<String>,
+    pub workflow_turns: Vec<WorkflowTurn>,
+    pub active_turn_idx: Option<usize>,
 }
 
 impl ChatState {
@@ -102,10 +227,49 @@ impl ChatState {
     pub fn clear(&mut self) {
         self.messages.clear();
         self.last_touched_files.clear();
+        self.workflow_turns.clear();
+        self.active_turn_idx = None;
     }
 
-    /// Build the Anthropic message history from chat state
-    /// Only includes user + assistant turns (not system messages)
+    pub fn begin_turn(&mut self, title: impl Into<String>) -> usize {
+        let turn = WorkflowTurn::new(title);
+        self.workflow_turns.push(turn);
+        let idx = self.workflow_turns.len() - 1;
+        self.active_turn_idx = Some(idx);
+        idx
+    }
+
+    pub fn push_step(&mut self, step: WorkflowStep) {
+        if let Some(idx) = self.active_turn_idx {
+            if let Some(turn) = self.workflow_turns.get_mut(idx) {
+                turn.push_step(step);
+            }
+        }
+    }
+
+    pub fn complete_last_step(&mut self) {
+        if let Some(idx) = self.active_turn_idx {
+            if let Some(turn) = self.workflow_turns.get_mut(idx) {
+                turn.complete_last_step();
+            }
+        }
+    }
+
+    pub fn finish_turn(&mut self, status: StepStatus) {
+        if let Some(idx) = self.active_turn_idx {
+            if let Some(turn) = self.workflow_turns.get_mut(idx) {
+                turn.finish(status);
+            }
+        }
+        self.active_turn_idx = None;
+    }
+
+    pub fn toggle_turn(&mut self, turn_id: u64) {
+        if let Some(turn) = self.workflow_turns.iter_mut().find(|t| t.id == turn_id) {
+            turn.expanded = !turn.expanded;
+        }
+    }
+
     pub fn to_api_messages(&self) -> Vec<ApiMessage> {
         self.messages
             .iter()
@@ -122,8 +286,6 @@ impl ChatState {
     }
 }
 
-/// Minimal Anthropic API message shape
-/// Full tool-use messages are built in agent/context.rs
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApiMessage {
     pub role: String,

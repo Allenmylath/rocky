@@ -3,16 +3,22 @@ use crate::agent::context::ConversationContext;
 use crate::agent::loop_runner::{run_turn, AgentEvent};
 use crate::serve::events::BuildEvent;
 use crate::serve::process::ServeHandle;
-use crate::state::chat::{ChatMessage, ChatState};
+use crate::state::chat::{ChatMessage, ChatState, StepKind, StepStatus, WorkflowStep};
 use crate::state::session::SessionState;
 use crate::ui::root::Root;
+use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// App entry point — provides global signals and launches the UI
 pub fn run() {
-    dioxus::launch(App);
+    let window = WindowBuilder::new()
+        .with_title("Rocky")
+        .with_maximized(true);
+
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(Config::new().with_window(window))
+        .launch(App);
 }
 
 #[component]
@@ -21,7 +27,6 @@ pub fn App() -> Element {
     let chat = use_context_provider(|| Signal::new(ChatState::default()));
     let config_sig = use_context_provider(|| Signal::new(ProviderConfig::default()));
 
-    // Auto-reopen the last project on launch
     use_effect(move || {
         let config = config_sig.read().clone();
         spawn(async move {
@@ -36,7 +41,6 @@ pub fn App() -> Element {
 
 // ── Project lifecycle ────────────────────────────────────────────────────────
 
-/// Called from the project picker when the user selects a directory.
 pub async fn start_project(
     project_path: PathBuf,
     mut session: Signal<SessionState>,
@@ -53,6 +57,12 @@ pub async fn start_project(
         project_path.display()
     )));
 
+    {
+        let mut c = chat.write();
+        let idx = c.begin_turn("dx serve → starting");
+        c.workflow_turns[idx].push_step(WorkflowStep::build("spawning dx serve..."));
+    }
+
     match ServeHandle::spawn(project_path.clone()).await {
         Ok((handle, event_rx)) => {
             std::mem::forget(handle);
@@ -63,6 +73,7 @@ pub async fn start_project(
                 "Failed to start dx serve: {}",
                 e
             )));
+            chat.write().finish_turn(StepStatus::Failed);
             session.write().serve_running = false;
         }
     }
@@ -80,18 +91,41 @@ fn spawn_build_event_loop(
     spawn(async move {
         let mut pending_diagnostics = vec![];
         let mut browser_opened = false;
+        let mut build_turn_active = true;
+        let mut had_startup_failure = false;
 
         while let Some(event) = event_rx.recv().await {
             match event {
                 BuildEvent::BuildStarted => {
                     pending_diagnostics.clear();
                     session.write().on_build_started();
-                    chat.write().push(ChatMessage::system("Building...".to_string()));
+
+                    {
+                        let mut c = chat.write();
+                        if build_turn_active {
+                            c.finish_turn(StepStatus::Complete);
+                        }
+                        let idx = c.begin_turn("dx serve → building");
+                        c.workflow_turns[idx].push_step(WorkflowStep::build("compiling..."));
+                        build_turn_active = true;
+                    }
                 }
 
                 BuildEvent::BuildSuccess => {
-                    pending_diagnostics.clear();
                     session.write().on_build_success();
+
+                    {
+                        let mut c = chat.write();
+                        c.complete_last_step();
+                        c.push_step(WorkflowStep {
+                            kind: StepKind::Build,
+                            summary: "ready ✓".to_string(),
+                            status: StepStatus::Complete,
+                        });
+                        c.finish_turn(StepStatus::Complete);
+                        build_turn_active = false;
+                    }
+
                     chat.write().push(ChatMessage::system("✓ Build succeeded".to_string()));
 
                     if !browser_opened {
@@ -111,32 +145,82 @@ fn spawn_build_event_loop(
                 BuildEvent::BuildFailed => {
                     let diags = pending_diagnostics.drain(..).collect::<Vec<_>>();
                     let count = diags.len();
-                    session.write().on_build_failed(diags.clone());
-                    chat.write().push(ChatMessage::auto_fix(diags.clone()));
 
-                    spawn_countdown_loop(
-                        session,
-                        chat.clone(),
-                        config.clone(),
-                        project_path.clone(),
-                        diags,
-                    );
+                    {
+                        let mut c = chat.write();
+                        c.complete_last_step();
+                        c.push_step(WorkflowStep {
+                            kind: StepKind::Build,
+                            summary: format!("{} error{}", count, if count == 1 { "" } else { "s" }),
+                            status: StepStatus::Failed,
+                        });
+                        c.finish_turn(StepStatus::Failed);
+                        build_turn_active = false;
+                    }
 
-                    tracing::debug!("Build failed with {} errors, countdown started", count);
+                    if count > 0 {
+                        had_startup_failure = false;
+                        session.write().on_build_failed(diags.clone());
+                        chat.write().push(ChatMessage::auto_fix(diags.clone()));
+                        spawn_countdown_loop(
+                            session,
+                            chat.clone(),
+                            config.clone(),
+                            project_path.clone(),
+                            diags,
+                        );
+                    }
                 }
 
                 BuildEvent::ProcessExited { code } => {
                     session.write().serve_running = false;
-                    chat.write().push(ChatMessage::system(format!(
-                        "dx serve exited (code: {:?})",
-                        code
-                    )));
+                    if build_turn_active {
+                        chat.write().finish_turn(StepStatus::Failed);
+                        build_turn_active = false;
+                    }
+
+                    // Any non-zero exit with log output → feed raw log to agent.
+                    // No pattern matching needed: the LLM reads the output and decides what to fix.
+                    let failed = code.map(|c| c != 0).unwrap_or(true);
+                    let raw_log = session.read().raw_log.clone();
+
+                    if failed && (had_startup_failure || !raw_log.is_empty()) {
+                        let log_text = raw_log
+                            .iter()
+                            .map(|l| strip_ansi_for_prompt(l))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let fix_prompt = format!(
+                            "`dx serve` failed to start. Here is the full output:\n\n```\n{}\n```\n\n\
+                            Read the project files and fix the problem.",
+                            log_text
+                        );
+                        chat.write().push(ChatMessage::system(
+                            "dx serve failed — asking Rocky to fix it...".to_string(),
+                        ));
+                        spawn_fatal_fix_turn(
+                            session,
+                            chat.clone(),
+                            config.clone(),
+                            project_path.clone(),
+                            fix_prompt,
+                        );
+                    } else {
+                        chat.write().push(ChatMessage::system(format!(
+                            "dx serve exited (code: {:?})",
+                            code
+                        )));
+                    }
                     break;
                 }
 
                 BuildEvent::StdoutLine(line) => {
                     tracing::trace!("dx serve: {}", line);
                     session.write().push_log(line);
+                }
+
+                BuildEvent::FatalError(_msg) => {
+                    had_startup_failure = true;
                 }
             }
         }
@@ -159,17 +243,13 @@ fn spawn_countdown_loop(
             let should_fire = session.write().tick_countdown();
 
             if should_fire {
-                tracing::debug!("Auto-fix countdown expired, firing agent");
                 spawn_agent_turn(session, chat, config, project_path, diagnostics).await;
                 return;
             }
 
             let state = session.read().auto_fix.clone();
             match state {
-                crate::state::session::AutoFixState::Stopped => {
-                    tracing::debug!("Auto-fix stopped by user");
-                    return;
-                }
+                crate::state::session::AutoFixState::Stopped => return,
                 crate::state::session::AutoFixState::Idle => return,
                 crate::state::session::AutoFixState::Countdown(_) => {}
             }
@@ -187,6 +267,18 @@ async fn spawn_agent_turn(
     diagnostics: Vec<crate::serve::events::RustcDiagnostic>,
 ) {
     chat.write().agent_running = true;
+
+    let iteration = {
+        chat.read()
+            .workflow_turns
+            .iter()
+            .filter(|t| t.title.starts_with("auto-fix"))
+            .count() as u8
+            + 1
+    };
+
+    chat.write()
+        .begin_turn(format!("auto-fix {}/5", iteration));
 
     let client = ModelClient::new(&config);
     let mut context = ConversationContext::default();
@@ -223,13 +315,26 @@ async fn spawn_agent_turn(
             AgentEvent::AssistantText(text) => {
                 assistant_text.push_str(&text);
             }
+
+            AgentEvent::ActionStarted(name, summary) => {
+                let kind = match name.as_str() {
+                    "read_file" => StepKind::ReadFile,
+                    "write_file" => StepKind::WriteFile,
+                    "list_files" => StepKind::ListFiles,
+                    _ => StepKind::Build,
+                };
+                chat.write().push_step(WorkflowStep::new(kind, summary));
+            }
+
             AgentEvent::ToolCalled(tc) => {
+                chat.write().complete_last_step();
                 tool_calls.push(tc);
             }
+
             AgentEvent::FileWritten(path) => {
                 chat.write().last_touched_files.push(path.clone());
-                tracing::debug!("Agent wrote: {}", path);
             }
+
             AgentEvent::TurnComplete => {
                 if !assistant_text.is_empty() || !tool_calls.is_empty() {
                     chat.write().push(ChatMessage::assistant(
@@ -237,14 +342,132 @@ async fn spawn_agent_turn(
                         tool_calls.clone(),
                     ));
                 }
+                chat.write().finish_turn(StepStatus::Complete);
                 break;
             }
+
             AgentEvent::Error(e) => {
                 chat.write().push(ChatMessage::system(format!("Agent error: {}", e)));
+                chat.write().finish_turn(StepStatus::Failed);
                 break;
             }
         }
     }
 
     chat.write().agent_running = false;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn strip_ansi_for_prompt(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for cc in chars.by_ref() {
+                if cc == 'm' { break; }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ── Fatal error fix turn ──────────────────────────────────────────────────────
+
+const MAX_FATAL_FIX_ITERATIONS: u8 = 4;
+
+fn spawn_fatal_fix_turn(
+    mut session: Signal<SessionState>,
+    mut chat: Signal<ChatState>,
+    config: ProviderConfig,
+    project_path: PathBuf,
+    prompt: String,
+) {
+    spawn(async move {
+        chat.write().agent_running = true;
+        chat.write().begin_turn("fix startup error");
+
+        let client = ModelClient::new(&config);
+        let mut context = ConversationContext::default();
+        context.push_user(&prompt);
+
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel(64);
+        let project_path_clone = project_path.clone();
+        spawn(async move {
+            if let Err(e) = run_turn(&client, &mut context, project_path_clone, agent_tx).await {
+                tracing::error!("Fatal fix turn failed: {}", e);
+            }
+        });
+
+        let mut assistant_text = String::new();
+        let mut tool_calls = vec![];
+        let mut files_written = false;
+
+        while let Some(event) = agent_rx.recv().await {
+            match event {
+                AgentEvent::AssistantText(t) => assistant_text.push_str(&t),
+
+                AgentEvent::ActionStarted(name, summary) => {
+                    let kind = match name.as_str() {
+                        "read_file" => StepKind::ReadFile,
+                        "write_file" => StepKind::WriteFile,
+                        "list_files" => StepKind::ListFiles,
+                        _ => StepKind::Build,
+                    };
+                    chat.write().push_step(WorkflowStep::new(kind, summary));
+                }
+
+                AgentEvent::ToolCalled(tc) => {
+                    chat.write().complete_last_step();
+                    tool_calls.push(tc);
+                }
+
+                AgentEvent::FileWritten(path) => {
+                    chat.write().last_touched_files.push(path);
+                    files_written = true;
+                }
+
+                AgentEvent::TurnComplete => {
+                    if !assistant_text.is_empty() || !tool_calls.is_empty() {
+                        chat.write().push(ChatMessage::assistant(
+                            assistant_text.clone(),
+                            tool_calls.clone(),
+                        ));
+                    }
+                    chat.write().finish_turn(StepStatus::Complete);
+                    break;
+                }
+
+                AgentEvent::Error(e) => {
+                    chat.write().push(ChatMessage::system(format!("Agent error: {}", e)));
+                    chat.write().finish_turn(StepStatus::Failed);
+                    files_written = false; // don't retry on agent error
+                    break;
+                }
+            }
+        }
+
+        chat.write().agent_running = false;
+
+        // If the agent wrote files, restart dx serve to verify the fix.
+        // The new run will trigger another fatal-fix turn if it fails again.
+        let iterations = session.read().fatal_fix_iterations;
+        if files_written && iterations < MAX_FATAL_FIX_ITERATIONS {
+            session.write().fatal_fix_iterations += 1;
+            chat.write().push(ChatMessage::system(format!(
+                "Restarting dx serve (attempt {}/{})...",
+                iterations + 1,
+                MAX_FATAL_FIX_ITERATIONS
+            )));
+            // Brief pause so file writes settle before cargo reads them
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            start_project(project_path, session, chat, config).await;
+        } else if files_written {
+            chat.write().push(ChatMessage::system(
+                "Max auto-fix attempts reached. Use ▶ Start dx serve to retry manually.".to_string(),
+            ));
+        }
+    });
 }

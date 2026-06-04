@@ -49,6 +49,8 @@ pub struct SessionState {
     pub auto_fix: AutoFixState,
     pub serve_running: bool,
     pub auto_fix_iterations: u8,
+    /// How many times we've tried to fix a fatal startup error (cargo metadata etc.)
+    pub fatal_fix_iterations: u8,
     /// Raw lines from dx serve — last 200 kept for the log panel
     pub raw_log: Vec<String>,
 }
@@ -64,6 +66,7 @@ impl Default for SessionState {
             auto_fix: AutoFixState::Idle,
             serve_running: false,
             auto_fix_iterations: 0,
+            fatal_fix_iterations: 0,
             raw_log: Vec::new(),
         }
     }
@@ -86,6 +89,7 @@ impl SessionState {
         self.build_status = BuildStatus::Success;
         self.auto_fix = AutoFixState::Idle;
         self.auto_fix_iterations = 0;
+        self.fatal_fix_iterations = 0;
     }
 
     pub fn on_build_failed(&mut self, diagnostics: Vec<RustcDiagnostic>) {
