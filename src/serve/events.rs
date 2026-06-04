@@ -18,6 +18,19 @@ impl DiagnosticLevel {
     }
 }
 
+/// Build stage mirroring Dioxus CLI's internal builder stages.
+/// Emitted as `BuildEvent::Progress` so the UI can show compile/bundle progress.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuildStage {
+    Initializing,
+    Compiling { current: usize, total: usize, krate: String },
+    Bundling,
+    Optimizing,
+    Success,
+    Failed,
+    Aborted,
+}
+
 /// A single rustc diagnostic parsed from `dx serve` stderr
 #[derive(Debug, Clone, PartialEq)]
 pub struct RustcDiagnostic {
@@ -106,4 +119,10 @@ pub enum BuildEvent {
     /// dx serve encountered a fatal setup error (e.g. missing Cargo.toml)
     /// Carries a user-friendly message with a suggested fix.
     FatalError(String),
+
+    /// Build stage progress update (compiling, bundling, etc.)
+    Progress { stage: BuildStage },
+
+    /// A specific crate started compiling
+    CompilingCrate { krate: String },
 }

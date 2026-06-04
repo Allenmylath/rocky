@@ -3,6 +3,29 @@ use rig_core::tool::Tool;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Debug)]
+pub struct ToolError(pub String);
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ToolError {}
+
+impl From<anyhow::Error> for ToolError {
+    fn from(e: anyhow::Error) -> Self {
+        ToolError(e.to_string())
+    }
+}
+
+impl From<std::io::Error> for ToolError {
+    fn from(e: std::io::Error) -> Self {
+        ToolError(e.to_string())
+    }
+}
+
 // ── ReadFile ─────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -24,7 +47,7 @@ impl Tool for ReadFile {
     const NAME: &'static str = "read_file";
     type Args = ReadFileArgs;
     type Output = ReadFileOutput;
-    type Error = anyhow::Error;
+    type Error = ToolError;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
@@ -71,7 +94,7 @@ impl Tool for WriteFile {
     const NAME: &'static str = "write_file";
     type Args = WriteFileArgs;
     type Output = WriteFileOutput;
-    type Error = anyhow::Error;
+    type Error = ToolError;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
@@ -120,7 +143,7 @@ impl Tool for ListFiles {
     const NAME: &'static str = "list_files";
     type Args = ListFilesArgs;
     type Output = ListFilesOutput;
-    type Error = anyhow::Error;
+    type Error = ToolError;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
@@ -162,7 +185,7 @@ impl Tool for RunCommand {
     const NAME: &'static str = "run_command";
     type Args = RunCommandArgs;
     type Output = RunCommandOutput;
-    type Error = anyhow::Error;
+    type Error = ToolError;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {

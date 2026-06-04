@@ -133,6 +133,17 @@ impl ConversationContext {
         msg
     }
 
+    /// Inject a file's content as a fenced code block into the conversation.
+    /// Used to give the LLM full source context for error-bearing files.
+    pub fn push_file_context(&mut self, path: impl Into<String>, content: impl Into<String>) {
+        let text = format!(
+            "File: `{}`\n\n```rust\n{}\n```",
+            path.into(),
+            content.into()
+        );
+        self.push_user(text);
+    }
+
     pub fn system_prompt() -> String {
         crate::agent::prompts::system_prompt()
     }

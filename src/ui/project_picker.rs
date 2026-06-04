@@ -38,9 +38,31 @@ pub fn ProjectPicker() -> Element {
 
             if let Some(folder) = folder {
                 let path = crate::config::find_project_root(&folder.path().to_path_buf());
-                start_project(path, session, chat, cfg).await;
+                start_project(path, session, chat, cfg, false).await;
             }
 
+            picking.set(false);
+        });
+    };
+
+    let on_sample = move |_| {
+        picking.set(true);
+        let session = session.clone();
+        let mut chat = chat.clone();
+        let cfg = config.read().clone();
+
+        spawn(async move {
+            match crate::sample_project::ensure_sample_project().await {
+                Ok(path) => {
+                    start_project(path, session, chat, cfg, true).await;
+                }
+                Err(e) => {
+                    chat.write().push(crate::state::chat::ChatMessage::system(format!(
+                        "Failed to scaffold sample project: {}",
+                        e
+                    )));
+                }
+            }
             picking.set(false);
         });
     };
@@ -162,6 +184,25 @@ pub fn ProjectPicker() -> Element {
                 disabled: *picking.read(),
                 onclick: on_pick,
                 if *picking.read() { "Opening..." } else { "Open Dioxus Project" }
+            }
+
+            div { style: "margin-top: 12px;",
+                button {
+                    style: "
+                        background: transparent;
+                        color: #888;
+                        border: 1px solid #444;
+                        padding: 10px 24px;
+                        border-radius: 6px;
+                        font-size: 13px;
+                        font-family: monospace;
+                        cursor: pointer;
+                        width: 100%;
+                    ",
+                    disabled: *picking.read(),
+                    onclick: on_sample,
+                    "▶ Try sample project"
+                }
             }
 
             if key_missing {

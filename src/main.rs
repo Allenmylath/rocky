@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod config;
 mod fs;
+mod sample_project;
 mod serve;
 mod state;
 mod ui;

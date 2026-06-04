@@ -1,35 +1,13 @@
-use crate::serve::events::{BuildEvent, DiagnosticLevel, RustcDiagnostic};
+use crate::serve::events::{BuildEvent, BuildStage, DiagnosticLevel, RustcDiagnostic};
 use crate::state::session::BuildTarget;
 
-// ── Line prefix stripping ────────────────────────────────────────────────────
-//
-// dx serve prefixes every line with a timestamp and tag:
-//   "21:28:19 [cargo] error: ..."
-//   "21:28:19 [dev] Build failed: ..."
-//
-// We strip the prefix and route by tag.
+// ── ANSI stripping ───────────────────────────────────────────────────────────
 
-#[derive(Debug, PartialEq)]
-enum LineTag {
-    Cargo,
-    Dev,
-    Other,
-}
-
-struct PrefixedLine<'a> {
-    tag: LineTag,
-    /// The content after the "[tag] " prefix, ANSI codes stripped
-    content: String,
-    _raw: &'a str,
-}
-
-/// Strip ANSI escape codes from a string
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            // consume until 'm'
             for cc in chars.by_ref() {
                 if cc == 'm' {
                     break;
@@ -42,47 +20,91 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Parse a dx serve output line into tag + content
-/// Format: "HH:MM:SS [tag] content" or "  N.NNs  TAG content"
-fn parse_prefix(raw: &str) -> PrefixedLine<'_> {
+// ── Line classification ──────────────────────────────────────────────────────
+//
+// dx serve emits lines in two distinct formats depending on the source:
+//
+// Format A — dx's own tracing logger (timestamped):
+//   "  2.05s  INFO Serving your app..."
+//   " 26.30s ERROR expected identifier"
+//   " 28.27s ERROR Build failed: ..."
+//
+// Format B — cargo JSON rendered output (tagged):
+//   "21:28:19 [cargo] error[E0308]: mismatched types"
+//   "21:28:19 [cargo]  --> src/main.rs:8:1"
+//   "21:28:19 [dev] Compiling 3 crates..."
+//
+// Both formats can appear in the same session. Format A errors have no
+// file/line info. Format B errors have full diagnostic structure.
+
+#[derive(Debug, PartialEq)]
+enum LineKind {
+    /// dx tracing INFO line — content after "INFO"
+    DxInfo(String),
+    /// dx tracing ERROR line — content after "ERROR"  
+    DxError(String),
+    /// cargo-tagged line — content after "[cargo]"
+    Cargo(String),
+    /// dev-tagged line — content after "[dev]"
+    Dev(String),
+    /// unclassified
+    Other(String),
+}
+
+fn classify(raw: &str) -> LineKind {
     let clean = strip_ansi(raw);
 
-    // Match "[cargo]" or "[dev]" anywhere in first ~30 chars
-    let (tag, content) = if let Some(pos) = clean.find("[cargo]") {
-        let rest = clean[pos + 7..].trim_start().to_string();
-        (LineTag::Cargo, rest)
-    } else if let Some(pos) = clean.find("[dev]") {
-        let rest = clean[pos + 5..].trim_start().to_string();
-        (LineTag::Dev, rest)
-    } else if let Some(pos) = clean.find("INFO") {
-        let rest = clean[pos + 4..].trim_start().to_string();
-        (LineTag::Dev, rest)
-    } else if let Some(pos) = clean.find("ERROR") {
-        let rest = clean[pos + 5..].trim_start().to_string();
-        (LineTag::Dev, rest)
-    } else {
-        (LineTag::Other, clean)
-    };
+    // Format B: tagged lines take priority
+    if let Some(pos) = clean.find("[cargo]") {
+        return LineKind::Cargo(clean[pos + 7..].trim_start().to_string());
+    }
+    if let Some(pos) = clean.find("[dev]") {
+        return LineKind::Dev(clean[pos + 5..].trim_start().to_string());
+    }
 
-    PrefixedLine {
-        tag,
-        content,
-        _raw: raw,
+    // Format A: timestamped tracing lines
+    // Pattern: optional whitespace, digits, '.', digits, 's', whitespace, LEVEL, space, content
+    // e.g. "  2.05s  INFO ..." or " 26.30s ERROR ..."
+    let trimmed = clean.trim_start();
+
+    // Find the level keyword after the timestamp
+    if let Some(info_pos) = find_level_keyword(trimmed, "INFO") {
+        return LineKind::DxInfo(trimmed[info_pos..].trim_start().to_string());
+    }
+    if let Some(err_pos) = find_level_keyword(trimmed, "ERROR") {
+        return LineKind::DxError(trimmed[err_pos..].trim_start().to_string());
+    }
+    if let Some(warn_pos) = find_level_keyword(trimmed, "WARN") {
+        // treat WARN same as INFO for routing purposes
+        return LineKind::DxInfo(trimmed[warn_pos..].trim_start().to_string());
+    }
+
+    LineKind::Other(clean)
+}
+
+/// Find a level keyword that appears after a timestamp-like prefix.
+/// Returns the index *after* the keyword if found.
+fn find_level_keyword(s: &str, keyword: &str) -> Option<usize> {
+    let pos = s.find(keyword)?;
+    // Sanity check: there should be only timestamp chars before it
+    let before = s[..pos].trim();
+    let looks_like_timestamp = before.is_empty()
+        || before
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == 's');
+    if looks_like_timestamp {
+        Some(pos + keyword.len())
+    } else {
+        None
     }
 }
 
-// ── Diagnostic header parsing ────────────────────────────────────────────────
+// ── Cargo diagnostic header parsing ─────────────────────────────────────────
 //
-// Patterns we need to match in [cargo] content:
-//
-//   error[E0308]: mismatched types        ← error with code
-//   error: expected item, found keyword   ← error without code
-//   warning[W...]: ...                    ← warning with code
-//    --> src\main.rs:8:1                  ← location line
-//   8 | let x: i32 = ...                 ← snippet line
-//     | ^^^                              ← annotation line
-//   error: could not compile `rocky`     ← end-of-errors sentinel
-//   warning: `rocky` generated N warnings ← end-of-warnings
+// Matches:
+//   "error[E0308]: mismatched types"
+//   "error: expected item, found keyword"
+//   "warning[W...]: ..."
 
 struct DiagHeader {
     level: DiagnosticLevel,
@@ -91,7 +113,6 @@ struct DiagHeader {
 }
 
 fn parse_diag_header(content: &str) -> Option<DiagHeader> {
-    // Must start with "error" or "warning"
     let (level_str, rest) = if content.starts_with("error") {
         ("error", &content["error".len()..])
     } else if content.starts_with("warning") {
@@ -102,15 +123,11 @@ fn parse_diag_header(content: &str) -> Option<DiagHeader> {
 
     let level = DiagnosticLevel::from_str(level_str);
 
-    // Check for [CODE] after level
     let (code, message) = if rest.starts_with('[') {
-        if let Some(end) = rest.find(']') {
-            let code = rest[1..end].to_string();
-            let msg = rest[end + 1..].trim_start_matches(':').trim().to_string();
-            (Some(code), msg)
-        } else {
-            return None;
-        }
+        let end = rest.find(']')?;
+        let code = rest[1..end].to_string();
+        let msg = rest[end + 1..].trim_start_matches(':').trim().to_string();
+        (Some(code), msg)
     } else if rest.starts_with(':') {
         let msg = rest[1..].trim().to_string();
         (None, msg)
@@ -118,10 +135,10 @@ fn parse_diag_header(content: &str) -> Option<DiagHeader> {
         return None;
     };
 
-    // Filter out the "could not compile" and "generated N warnings" sentinels
-    // — these are not real diagnostics
+    // Filter sentinels — these are summary lines not real diagnostics
     if message.starts_with("could not compile")
         || message.contains("generated")
+        || message.contains("aborting due to")
         || message.is_empty()
     {
         return None;
@@ -134,64 +151,89 @@ fn parse_diag_header(content: &str) -> Option<DiagHeader> {
     })
 }
 
-/// Parse " --> src\main.rs:8:1" into (file, line, col)
+/// Parse " --> src/main.rs:8:1" into (file, line, col)
 fn parse_location(content: &str) -> Option<(String, u32, u32)> {
     let content = content.trim();
     if !content.starts_with("-->") {
         return None;
     }
     let loc = content[3..].trim();
-
-    // Split on last ':' for col, second-to-last for line
-    // Handle Windows paths like src\main.rs:8:1
     let parts: Vec<&str> = loc.rsplitn(3, ':').collect();
     if parts.len() < 3 {
         return None;
     }
     let col = parts[0].trim().parse::<u32>().ok()?;
     let line = parts[1].trim().parse::<u32>().ok()?;
-    // Normalize Windows backslashes to forward slashes
     let file = parts[2].trim().replace('\\', "/");
-
     Some((file, line, col))
 }
 
-/// Detect build target from the long "Caused by: process didn't exit" line
-/// which contains --target <triple>
+/// Detect build target from lines mentioning --target <triple>
 fn detect_target(content: &str) -> Option<BuildTarget> {
     if content.contains("wasm32-unknown-unknown") {
         Some(BuildTarget::Client)
     } else if content.contains("--target") {
-        // Any other explicit target is the native server build
         Some(BuildTarget::Server)
     } else {
         None
     }
 }
 
-// ── Parser state machine ─────────────────────────────────────────────────────
+/// Parse "Compiling X/Y: crate_name" or "Compiling crate_name vX.Y.Z"
+/// Returns (current, total, krate_name) if it looks like a progress line,
+/// or just (0, 0, krate_name) for a plain "Compiling crate_name" line.
+fn parse_compiling_line(content: &str) -> Option<(usize, usize, String)> {
+    // Strip "Compiling " prefix
+    let rest = content.strip_prefix("Compiling ")?;
 
-/// What state the parser is currently in
-#[derive(Debug, PartialEq)]
-enum ParserState {
-    /// Waiting for a diagnostic header or lifecycle event
-    Idle,
-    /// Saw a diagnostic header, waiting for location line " --> "
-    WaitingForLocation,
-    /// Saw location, accumulating snippet lines
-    AccumulatingSnippet,
+    // Try "N/M: name" format first
+    if let Some(slash_pos) = rest.find('/') {
+        let current_str = &rest[..slash_pos];
+        if let Ok(current) = current_str.trim().parse::<usize>() {
+            let after_slash = &rest[slash_pos + 1..];
+            if let Some(colon_pos) = after_slash.find(':') {
+                let total_str = &after_slash[..colon_pos];
+                if let Ok(total) = total_str.trim().parse::<usize>() {
+                    let krate = after_slash[colon_pos + 1..].trim().to_string();
+                    return Some((current, total, krate));
+                }
+            }
+        }
+    }
+
+    // Plain "Compiling crate_name vX.Y.Z (path)" — extract just the name
+    let krate = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or(rest)
+        .to_string();
+
+    Some((0, 0, krate))
 }
 
-/// Stateful parser — accumulates lines across calls to handle
-/// multi-line diagnostic blocks from `dx serve` stderr output
-pub struct StderrParser {
-    state: ParserState,
-    current_diag: Option<PartialDiagnostic>,
-    current_target: BuildTarget,
-    pending: Vec<BuildEvent>,
-    /// Last non-lifecycle error message seen (used as fallback diagnostic when
-    /// BuildFailed fires without any cargo-format diagnostics, e.g. WASM config errors)
-    last_error_msg: Option<String>,
+// ── Parser state machine ─────────────────────────────────────────────────────
+//
+// Key design decisions vs the old parser:
+//
+// 1. DxError lines (Format A) are collected into a separate `dx_errors` vec
+//    rather than being routed through the cargo diagnostic state machine.
+//    They become location-less RustcDiagnostics on BuildFailed.
+//
+// 2. BuildSuccess is only emitted after we verify no DxError lines or cargo
+//    diagnostics are pending. The "Serving your app" line can appear before
+//    error output on some dx versions, so we defer the success signal.
+//
+// 3. The cargo diagnostic state machine is unchanged in structure but now
+//    correctly handles a new diagnostic header arriving while in
+//    WaitingForLocation (flush + restart).
+//
+// 4. Progress events are emitted for Compiling lines.
+
+#[derive(Debug, PartialEq)]
+enum ParserState {
+    Idle,
+    WaitingForLocation,
+    AccumulatingSnippet,
 }
 
 struct PartialDiagnostic {
@@ -206,8 +248,8 @@ struct PartialDiagnostic {
 }
 
 impl PartialDiagnostic {
-    fn into_event(self) -> BuildEvent {
-        BuildEvent::DiagnosticEmitted(RustcDiagnostic {
+    fn into_diagnostic(self) -> RustcDiagnostic {
+        RustcDiagnostic {
             level: self.level,
             code: self.code,
             message: self.message,
@@ -216,172 +258,233 @@ impl PartialDiagnostic {
             col: self.col,
             snippet: self.snippet,
             target: self.target,
-        })
+        }
     }
+}
+
+pub struct StderrParser {
+    state: ParserState,
+
+    /// In-progress cargo-format diagnostic (has location)
+    current_cargo_diag: Option<PartialDiagnostic>,
+
+    /// Errors from dx's own ERROR lines (no location info)
+    dx_errors: Vec<String>,
+
+    /// All fully parsed cargo diagnostics so far this build cycle
+    cargo_diagnostics: Vec<RustcDiagnostic>,
+
+    current_target: BuildTarget,
+
+    /// True once we've seen "Serving your app" but haven't confirmed
+    /// there are no pending errors yet
+    pending_success: bool,
 }
 
 impl StderrParser {
     pub fn new() -> Self {
         Self {
             state: ParserState::Idle,
-            current_diag: None,
+            current_cargo_diag: None,
+            dx_errors: Vec::new(),
+            cargo_diagnostics: Vec::new(),
             current_target: BuildTarget::Unknown,
-            pending: vec![],
-            last_error_msg: None,
+            pending_success: false,
         }
     }
 
-    /// Feed one line of dx serve output — returns zero or more events
+    /// Feed one raw line from dx serve output.
+    /// Returns zero or more events to dispatch.
     pub fn feed_line(&mut self, raw: &str) -> Vec<BuildEvent> {
-        let mut events = vec![];
+        let mut events = Vec::new();
+        // Snapshot whether we already had a pending success *before* this line.
+        // This lets us defer BuildSuccess emission until the NEXT non-error line.
+        let had_pending = self.pending_success;
 
-        // Always forward every non-empty line to the raw log panel
+        // Always forward non-empty lines to the raw log
         if !raw.trim().is_empty() {
             events.push(BuildEvent::StdoutLine(raw.to_string()));
         }
 
-        let pl = parse_prefix(raw);
+        match classify(raw) {
+            LineKind::DxInfo(content) => {
+                self.handle_dx_info(&content, &mut events);
+            }
+            LineKind::DxError(content) => {
+                self.handle_dx_error(&content, &mut events);
+            }
+            LineKind::Cargo(content) => {
+                self.handle_cargo_line(&content, &mut events);
+            }
+            LineKind::Dev(content) => {
+                self.handle_dev_line(&content, &mut events);
+            }
+            LineKind::Other(content) => {
+                self.handle_other_line(&content, &mut events);
+            }
+        }
 
-        match pl.tag {
-            LineTag::Dev => {
-                self.handle_dev_line(&pl.content, &mut events);
-            }
-            LineTag::Cargo => {
-                self.handle_cargo_line(&pl.content, &mut events);
-            }
-            LineTag::Other => {
-                if pl.content.contains("Serving your app") {
-                    self.flush_current_diag(&mut events);
-                    events.push(BuildEvent::BuildSuccess);
-                    self.state = ParserState::Idle;
-                    self.current_target = BuildTarget::Unknown;
-                }
-            }
+        // Deferred success confirmation:
+        // Only emit BuildSuccess if pending_success was already true BEFORE this
+        // line, it's still true after handling, this line is structured dx output
+        // (not untagged boilerplate), and it's not an error signal.
+        let is_structured_dx = matches!(
+            classify(raw),
+            LineKind::DxInfo(_) | LineKind::DxError(_) | LineKind::Dev(_)
+        );
+        if had_pending
+            && self.pending_success
+            && is_structured_dx
+            && !raw.contains("ERROR")
+            && !raw.contains("Build failed")
+        {
+            self.try_emit_success(&mut events);
         }
 
         events
     }
 
-    fn handle_dev_line(&mut self, content: &str, events: &mut Vec<BuildEvent>) {
+    /// Call at end of stream to flush any pending state
+    pub fn flush(&mut self) -> Vec<BuildEvent> {
+        let mut events = Vec::new();
+        self.flush_cargo_diag(&mut events);
+        events
+    }
+
+    // ── Line handlers ────────────────────────────────────────────────────────
+
+    fn handle_dx_info(&mut self, content: &str, events: &mut Vec<BuildEvent>) {
         if content.contains("Serving your app") {
-            self.flush_current_diag(events);
-            events.push(BuildEvent::BuildSuccess);
-            self.state = ParserState::Idle;
-            self.current_target = BuildTarget::Unknown;
-        } else if content.contains("Build failed") {
-            self.flush_current_diag(events);
-            // If no cargo-format diagnostics were captured (e.g. WASM config errors
-            // that dx emits as plain ERROR lines), synthesize one from the last
-            // error message we saw so the user sees something useful.
-            if let Some(msg) = self.last_error_msg.take() {
-                events.push(BuildEvent::DiagnosticEmitted(RustcDiagnostic {
-                    level: DiagnosticLevel::Error,
-                    code: None,
-                    message: msg,
-                    file: String::new(),
-                    line: 0,
-                    col: 0,
-                    snippet: vec![],
-                    target: self.current_target.clone(),
-                }));
-            }
-            events.push(BuildEvent::BuildFailed);
-            self.state = ParserState::Idle;
-        } else if content.contains("Compiling") || content.contains("Rebuilding") {
-            self.flush_current_diag(events);
-            self.last_error_msg = None;
-            events.push(BuildEvent::BuildStarted);
-            self.state = ParserState::Idle;
+            // Don't emit success immediately — wait to confirm no errors follow.
+            // We set a flag and emit on the next non-error line or on flush.
+            self.pending_success = true;
+        } else if content.contains("Rebuilding")
+            || content.contains("Compiling")
+            || content.contains("Starting build")
+        {
+            self.start_new_build(events);
         } else if content.contains("cargo metadata") {
             events.push(BuildEvent::FatalError(content.to_string()));
-        } else if !content.is_empty() {
-            // Save non-lifecycle dev/error lines as a fallback message.
-            // These capture things like "the wasm*-unknown-unknown targets are
-            // not supported by default, you may need to enable the 'js' feature"
-            self.last_error_msg = Some(content.to_string());
+        } else if content.contains("Bundling") {
+            events.push(BuildEvent::Progress {
+                stage: BuildStage::Bundling,
+            });
+        } else if content.contains("Optimizing") {
+            events.push(BuildEvent::Progress {
+                stage: BuildStage::Optimizing,
+            });
+        }
+    }
+
+    fn handle_dx_error(&mut self, content: &str, events: &mut Vec<BuildEvent>) {
+        // If we had a pending success, that's now invalidated
+        self.pending_success = false;
+
+        if content.contains("Build failed") {
+            self.flush_cargo_diag(events);
+            self.emit_build_failed(events);
+        } else if content.contains("cargo metadata") {
+            events.push(BuildEvent::FatalError(content.to_string()));
+        } else {
+            // Accumulate as a location-less error for later
+            // Strip any remaining ANSI that snuck through
+            let clean = strip_ansi(content);
+            if !clean.trim().is_empty()
+                && !clean.contains("could not compile")
+                && !clean.contains("aborting due to")
+                && !clean.contains("Some errors have detailed")
+                && !clean.contains("For more information about")
+            {
+                self.dx_errors.push(clean.trim().to_string());
+            }
         }
     }
 
     fn handle_cargo_line(&mut self, content: &str, events: &mut Vec<BuildEvent>) {
-        // Detect target from "Caused by" lines
+        // Detect target triple from linker invocation lines
         if let Some(target) = detect_target(content) {
             self.current_target = target;
         }
 
+        // Cancel any pending success when cargo starts emitting diagnostics
+        if parse_diag_header(content).is_some() {
+            self.pending_success = false;
+        }
+
         match self.state {
             ParserState::Idle => {
-                // Try to parse a diagnostic header
                 if let Some(header) = parse_diag_header(content) {
-                    self.current_diag = Some(PartialDiagnostic {
+                    self.current_cargo_diag = Some(PartialDiagnostic {
                         level: header.level,
                         code: header.code,
                         message: header.message,
                         file: String::new(),
                         line: 0,
                         col: 0,
-                        snippet: vec![],
+                        snippet: Vec::new(),
                         target: self.current_target.clone(),
                     });
                     self.state = ParserState::WaitingForLocation;
-                }
-                // "Compiling <crate>" signals a new build cycle
-                else if content.starts_with("Compiling ") {
-                    self.flush_current_diag(events);
-                    events.push(BuildEvent::BuildStarted);
+                } else if content.starts_with("Compiling ") {
+                    self.handle_compiling_line(content, events);
                 }
             }
 
             ParserState::WaitingForLocation => {
                 if let Some((file, line, col)) = parse_location(content) {
-                    if let Some(ref mut diag) = self.current_diag {
+                    if let Some(ref mut diag) = self.current_cargo_diag {
                         diag.file = file;
                         diag.line = line;
                         diag.col = col;
                     }
                     self.state = ParserState::AccumulatingSnippet;
                 } else if let Some(header) = parse_diag_header(content) {
-                    // New diagnostic started before we got a location — flush old one
-                    self.flush_current_diag(events);
-                    self.current_diag = Some(PartialDiagnostic {
+                    // New diagnostic before we got a location — flush incomplete one
+                    // An incomplete diagnostic with a message is still useful
+                    self.flush_cargo_diag(events);
+                    self.current_cargo_diag = Some(PartialDiagnostic {
                         level: header.level,
                         code: header.code,
                         message: header.message,
                         file: String::new(),
                         line: 0,
                         col: 0,
-                        snippet: vec![],
+                        snippet: Vec::new(),
                         target: self.current_target.clone(),
                     });
+                    // Stay in WaitingForLocation
                 }
             }
 
             ParserState::AccumulatingSnippet => {
-                // A new diagnostic header means the previous block is complete
                 if let Some(header) = parse_diag_header(content) {
-                    // But skip sentinels like "error: could not compile"
-                    self.flush_current_diag(events);
-                    self.current_diag = Some(PartialDiagnostic {
+                    self.flush_cargo_diag(events);
+                    self.current_cargo_diag = Some(PartialDiagnostic {
                         level: header.level,
                         code: header.code,
                         message: header.message,
                         file: String::new(),
                         line: 0,
                         col: 0,
-                        snippet: vec![],
+                        snippet: Vec::new(),
                         target: self.current_target.clone(),
                     });
                     self.state = ParserState::WaitingForLocation;
                 } else {
-                    // Accumulate snippet line — keep only pipe-prefixed lines
-                    // which are the actual code context (not help/note prose)
+                    // Accumulate snippet lines — pipe-prefixed or location lines
                     let trimmed = content.trim();
-                    if trimmed.starts_with('|')
+                    let is_snippet = trimmed.starts_with('|')
                         || trimmed.starts_with("-->")
+                        || trimmed.starts_with("= ")
                         || (trimmed.len() > 0
-                            && trimmed.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-                            && trimmed.contains('|'))
-                    {
-                        if let Some(ref mut diag) = self.current_diag {
+                            && trimmed
+                                .chars()
+                                .next()
+                                .map(|c| c.is_ascii_digit())
+                                .unwrap_or(false)
+                            && trimmed.contains('|'));
+                    if is_snippet {
+                        if let Some(ref mut diag) = self.current_cargo_diag {
                             diag.snippet.push(content.to_string());
                         }
                     }
@@ -390,23 +493,120 @@ impl StderrParser {
         }
     }
 
-    /// Flush the current in-progress diagnostic as an event
-    fn flush_current_diag(&mut self, events: &mut Vec<BuildEvent>) {
-        if let Some(diag) = self.current_diag.take() {
-            // Only emit if we have at minimum a message
-            // (skip incomplete diagnostics with no location)
+    fn handle_dev_line(&mut self, content: &str, events: &mut Vec<BuildEvent>) {
+        if content.contains("Serving your app") {
+            self.pending_success = true;
+        } else if content.contains("Build failed") {
+            self.pending_success = false;
+            self.flush_cargo_diag(events);
+            self.emit_build_failed(events);
+        } else if content.contains("Compiling") || content.contains("Rebuilding") {
+            self.start_new_build(events);
+        } else if content.contains("cargo metadata") {
+            events.push(BuildEvent::FatalError(content.to_string()));
+        }
+    }
+
+    fn handle_other_line(&mut self, content: &str, _events: &mut Vec<BuildEvent>) {
+        if content.contains("Serving your app") {
+            self.pending_success = true;
+        }
+    }
+
+    fn handle_compiling_line(&mut self, content: &str, events: &mut Vec<BuildEvent>) {
+        if let Some((current, total, krate)) = parse_compiling_line(content) {
+            if current > 0 && total > 0 {
+                events.push(BuildEvent::Progress {
+                    stage: BuildStage::Compiling {
+                        current,
+                        total,
+                        krate: krate.clone(),
+                    },
+                });
+            }
+            events.push(BuildEvent::CompilingCrate { krate });
+        }
+    }
+
+    // ── State transitions ────────────────────────────────────────────────────
+
+    fn start_new_build(&mut self, events: &mut Vec<BuildEvent>) {
+        self.flush_cargo_diag(events);
+        self.dx_errors.clear();
+        self.cargo_diagnostics.clear();
+        self.pending_success = false;
+        self.current_target = BuildTarget::Unknown;
+        self.state = ParserState::Idle;
+        events.push(BuildEvent::BuildStarted);
+        events.push(BuildEvent::Progress {
+            stage: BuildStage::Initializing,
+        });
+    }
+
+    /// Flush the in-progress cargo diagnostic into `cargo_diagnostics`
+    /// and emit a `DiagnosticEmitted` event
+    fn flush_cargo_diag(&mut self, events: &mut Vec<BuildEvent>) {
+        if let Some(diag) = self.current_cargo_diag.take() {
             if !diag.message.is_empty() {
-                events.push(diag.into_event());
+                let d = diag.into_diagnostic();
+                events.push(BuildEvent::DiagnosticEmitted(d.clone()));
+                self.cargo_diagnostics.push(d);
             }
         }
         self.state = ParserState::Idle;
     }
 
-    /// Call at end of stream to flush any in-progress diagnostic
-    pub fn flush(&mut self) -> Vec<BuildEvent> {
-        let mut events = vec![];
-        self.flush_current_diag(&mut events);
-        events
+    /// Emit BuildFailed, synthesizing diagnostics from dx ERROR lines
+    /// if no cargo-format diagnostics were captured
+    fn emit_build_failed(&mut self, events: &mut Vec<BuildEvent>) {
+        // If we have no cargo diagnostics but have dx ERROR lines,
+        // synthesize location-less diagnostics from them so the LLM
+        // gets something useful
+        if self.cargo_diagnostics.is_empty() && !self.dx_errors.is_empty() {
+            for msg in self.dx_errors.drain(..) {
+                let d = RustcDiagnostic {
+                    level: DiagnosticLevel::Error,
+                    code: None,
+                    message: msg,
+                    file: String::new(),
+                    line: 0,
+                    col: 0,
+                    snippet: Vec::new(),
+                    target: self.current_target.clone(),
+                };
+                events.push(BuildEvent::DiagnosticEmitted(d.clone()));
+                self.cargo_diagnostics.push(d);
+            }
+        } else {
+            self.dx_errors.clear();
+        }
+
+        events.push(BuildEvent::BuildFailed);
+        events.push(BuildEvent::Progress {
+            stage: BuildStage::Failed,
+        });
+
+        // Reset for next cycle
+        self.cargo_diagnostics.clear();
+        self.state = ParserState::Idle;
+        self.current_target = BuildTarget::Unknown;
+    }
+
+    fn try_emit_success(&mut self, events: &mut Vec<BuildEvent>) {
+        if !self.pending_success {
+            return;
+        }
+        self.pending_success = false;
+        self.flush_cargo_diag(events);
+
+        // Only emit success if we have no accumulated errors
+        if self.cargo_diagnostics.is_empty() && self.dx_errors.is_empty() {
+            events.push(BuildEvent::BuildSuccess);
+            events.push(BuildEvent::Progress {
+                stage: BuildStage::Success,
+            });
+        }
+        // If there are errors, they'll be emitted when BuildFailed arrives
     }
 }
 
@@ -416,68 +616,134 @@ impl StderrParser {
 mod tests {
     use super::*;
 
-    fn make_cargo_line(content: &str) -> String {
-        format!("21:28:19 [cargo] {}", content)
-    }
+    // ── classify() tests ─────────────────────────────────────────────────────
 
-    fn make_dev_line(content: &str) -> String {
-        format!("21:28:19 [dev] {}", content)
+    #[test]
+    fn test_classify_dx_info() {
+        let line = "  2.05s  INFO Serving your app: dioxus_app! 🚀";
+        match classify(line) {
+            LineKind::DxInfo(content) => assert!(content.contains("Serving your app")),
+            other => panic!("expected DxInfo, got {:?}", other),
+        }
     }
 
     #[test]
-    fn test_strip_ansi() {
-        let input = "\x1b[33mwarning\x1b[0m: something";
-        assert_eq!(strip_ansi(input), "warning: something");
+    fn test_classify_dx_error() {
+        let line = " 26.30s ERROR expected identifier";
+        match classify(line) {
+            LineKind::DxError(content) => assert_eq!(content, "expected identifier"),
+            other => panic!("expected DxError, got {:?}", other),
+        }
     }
 
     #[test]
-    fn test_parse_location_windows() {
-        let result = parse_location("--> src\\main.rs:8:1");
-        assert_eq!(result, Some(("src/main.rs".to_string(), 8, 1)));
+    fn test_classify_cargo_tagged() {
+        let line = "21:28:19 [cargo] error[E0308]: mismatched types";
+        match classify(line) {
+            LineKind::Cargo(content) => assert!(content.starts_with("error[E0308]")),
+            other => panic!("expected Cargo, got {:?}", other),
+        }
     }
 
     #[test]
-    fn test_parse_location_unix() {
-        let result = parse_location("--> src/components/app.rs:42:5");
-        assert_eq!(result, Some(("src/components/app.rs".to_string(), 42, 5)));
+    fn test_classify_ansi_stripped() {
+        let line = "\x1b[33mwarning\x1b[0m: Waiting for cargo-metadata...";
+        // No tag, no timestamp level keyword → Other
+        match classify(line) {
+            LineKind::Other(content) => assert!(content.contains("warning")),
+            other => panic!("expected Other, got {:?}", other),
+        }
     }
 
-    #[test]
-    fn test_parse_diag_header_with_code() {
-        let h = parse_diag_header("error[E0308]: mismatched types").unwrap();
-        assert_eq!(h.code, Some("E0308".to_string()));
-        assert_eq!(h.message, "mismatched types");
-        assert_eq!(h.level, DiagnosticLevel::Error);
-    }
+    // ── Real output sample from the bug report ───────────────────────────────
 
     #[test]
-    fn test_parse_diag_header_no_code() {
-        let h = parse_diag_header("error: expected item, found keyword `let`").unwrap();
-        assert!(h.code.is_none());
-        assert_eq!(h.message, "expected item, found keyword `let`");
-    }
-
-    #[test]
-    fn test_parse_diag_header_sentinel_skipped() {
-        assert!(parse_diag_header("error: could not compile `rocky`").is_none());
-    }
-
-    #[test]
-    fn test_full_error_block() {
-        let mut parser = StderrParser::new();
-        let lines = vec![
-            make_cargo_line("error: expected item, found keyword `let`"),
-            make_cargo_line(" --> src\\main.rs:8:1"),
-            make_cargo_line("  |"),
-            make_cargo_line("8 | let x: i32 = \"this is wrong\";"),
-            make_cargo_line("  | ^^^"),
-            make_cargo_line("  |"),
-            make_cargo_line("  | `let` cannot be used for global variables"),
-            make_cargo_line("error: could not compile `rocky` due to 1 previous error"),
-            make_dev_line("Build failed: cargo build finished with errors"),
+    fn test_real_dx_serve_output_sample() {
+        let raw_lines = vec![
+            "\x1b[33mwarning\x1b[0m: Waiting for cargo-metadata...",
+            "  2.05s  INFO -----------------------------------------------------------------",
+            "               Serving your app: dioxus_app! \u{1f680}",
+            "               • Press \x1b[33m`ctrl+c`\x1b[0m to exit the server",
+            " 26.30s ERROR expected identifier",
+            " 26.68s ERROR unresolved import `crate::server::customer`",
+            " 26.68s ERROR unresolved import `dioxus_desktop`",
+            " 26.94s ERROR cannot find type `Scope` in this scope",
+            " 27.47s ERROR cannot find function `use_state` in this scope",
+            " 27.98s ERROR mismatched types",
+            " 28.05s ERROR this method takes 1 argument but 0 arguments were supplied",
+            " 28.21s ERROR Some errors have detailed explanations: E0061, E0308, E0425, E0432.",
+            " 28.21s ERROR For more information about an error, try `rustc --explain E0061`.",
+            " 28.27s ERROR \x1b[31mBuild failed\x1b[0m: cargo build finished with errors for target: dioxus_app [x86_64-pc-windows-msvc]",
         ];
 
-        let mut all_events = vec![];
+        let mut parser = StderrParser::new();
+        let mut all_events: Vec<BuildEvent> = Vec::new();
+
+        for line in &raw_lines {
+            all_events.extend(parser.feed_line(line));
+        }
+        all_events.extend(parser.flush());
+
+        // Must NOT emit BuildSuccess
+        assert!(
+            !all_events.iter().any(|e| matches!(e, BuildEvent::BuildSuccess)),
+            "BuildSuccess should not be emitted when errors follow"
+        );
+
+        // Must emit BuildFailed
+        assert!(
+            all_events.iter().any(|e| matches!(e, BuildEvent::BuildFailed)),
+            "BuildFailed must be emitted"
+        );
+
+        // Must emit diagnostics for the real errors (not the sentinels)
+        let diags: Vec<_> = all_events
+            .iter()
+            .filter_map(|e| match e {
+                BuildEvent::DiagnosticEmitted(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+
+        assert!(!diags.is_empty(), "should have diagnostics");
+
+        // Sentinels filtered out
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("Some errors have detailed")),
+            "sentinel lines should be filtered"
+        );
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("For more information")),
+            "help lines should be filtered"
+        );
+
+        // Real errors present
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("expected identifier")));
+        assert!(messages.iter().any(|m| m.contains("mismatched types")));
+        assert!(messages.iter().any(|m| m.contains("unresolved import")));
+    }
+
+    // ── Cargo-format diagnostic block ────────────────────────────────────────
+
+    #[test]
+    fn test_cargo_format_full_block() {
+        let mut parser = StderrParser::new();
+        let lines = vec![
+            "21:28:19 [cargo] error[E0308]: mismatched types",
+            "21:28:19 [cargo]  --> src/main.rs:8:5",
+            "21:28:19 [cargo]   |",
+            "21:28:19 [cargo] 8 |     let x: i32 = \"hello\";",
+            "21:28:19 [cargo]   |                   ^^^^^^^ expected `i32`, found `&str`",
+            "21:28:19 [cargo] error: could not compile `rocky`",
+            "21:28:19 [dev] Build failed: cargo build finished with errors",
+        ];
+
+        let mut all_events = Vec::new();
         for line in &lines {
             all_events.extend(parser.feed_line(line));
         }
@@ -492,38 +758,154 @@ mod tests {
             .collect();
 
         assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, Some("E0308".to_string()));
         assert_eq!(diags[0].file, "src/main.rs");
         assert_eq!(diags[0].line, 8);
-        assert_eq!(diags[0].col, 1);
-        assert!(diags[0].message.contains("expected item"));
-
-        let has_failed = all_events
-            .iter()
-            .any(|e| matches!(e, BuildEvent::BuildFailed));
-        assert!(has_failed);
+        assert_eq!(diags[0].col, 5);
+        assert!(!diags[0].snippet.is_empty());
     }
 
+    // ── Clean build success ───────────────────────────────────────────────────
+
     #[test]
-    fn test_success_event() {
+    fn test_clean_build_success() {
         let mut parser = StderrParser::new();
-        let line = "  5.43s  INFO Serving your app: rocky! 🚀";
-        let events = parser.feed_line(line);
-        assert!(events.iter().any(|e| matches!(e, BuildEvent::BuildSuccess)));
+        let lines = vec![
+            "  1.20s  INFO Compiling rocky v0.1.0",
+            "  5.43s  INFO Serving your app: rocky! \u{1f680}",
+            "  5.43s  INFO  • Press `ctrl+c` to exit",
+        ];
+
+        let mut all_events = Vec::new();
+        for line in &lines {
+            all_events.extend(parser.feed_line(line));
+        }
+        all_events.extend(parser.flush());
+
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, BuildEvent::BuildSuccess)),
+            "clean build should emit BuildSuccess"
+        );
+        assert!(
+            !all_events
+                .iter()
+                .any(|e| matches!(e, BuildEvent::BuildFailed)),
+            "clean build should not emit BuildFailed"
+        );
     }
 
+    // ── Progress events ───────────────────────────────────────────────────────
+
     #[test]
-    fn test_target_detection_wasm() {
+    fn test_progress_compiling_emitted() {
+        let mut parser = StderrParser::new();
+        let events = parser.feed_line("21:28:19 [cargo] Compiling rocky v0.1.0 (/path)");
+        assert!(events.iter().any(|e| matches!(e, BuildEvent::CompilingCrate { .. })));
+    }
+
+    // ── Windows path normalization ────────────────────────────────────────────
+
+    #[test]
+    fn test_windows_path_normalized() {
+        let result = parse_location("--> src\\components\\app.rs:42:5");
         assert_eq!(
-            detect_target("--target wasm32-unknown-unknown -C opt-level"),
+            result,
+            Some(("src/components/app.rs".to_string(), 42, 5))
+        );
+    }
+
+    // ── Target detection ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_wasm_target_detected() {
+        assert_eq!(
+            detect_target("--target wasm32-unknown-unknown"),
             Some(BuildTarget::Client)
         );
     }
 
     #[test]
-    fn test_target_detection_native() {
+    fn test_native_target_detected() {
         assert_eq!(
-            detect_target("--target x86_64-pc-windows-msvc -C debuginfo"),
+            detect_target("--target x86_64-pc-windows-msvc"),
             Some(BuildTarget::Server)
+        );
+    }
+
+    // ── Real dx serve output from broken rocky project ───────────────────────
+    // This test uses stderr captured from an actual `dx serve` run on a project
+    // with compile errors (mismatched types, unresolved symbol). It validates
+    // that the parser handles real-world output including WARN lines and
+    // rustc command dumps that follow the actual errors.
+
+    #[test]
+    fn test_real_broken_project_output() {
+        let raw_lines = vec![
+            "  1.38s  INFO -----------------------------------------------------------------",
+            "                Serving your app: rocky! 🚀",
+            "               • Press `ctrl+c` to exit the server",
+            "  5.74s ERROR cannot find `sample_project` in `crate`",
+            "  5.76s ERROR cannot find value `unresolved_symbol_12345` in this scope",
+            "  7.30s ERROR mismatched types",
+            "  7.81s ERROR Some errors have detailed explanations: E0308, E0425, E0433.",
+            "  7.81s ERROR For more information about an error, try `rustc --explain E0308`.",
+            "  7.84s  WARN error: could not compile `rocky` (bin `rocky`) due to 3 previous errors; 6 warnings emitted",
+            "  7.84s  WARN Caused by:",
+            "  7.84s  WARN   process didn't exit successfully: `C:\\Users\\...\\rustc.exe` ...",
+            "  7.84s ERROR Build failed: cargo build finished with errors for target: rocky [x86_64-pc-windows-msvc]",
+        ];
+
+        let mut parser = StderrParser::new();
+        let mut all_events: Vec<BuildEvent> = Vec::new();
+
+        for line in &raw_lines {
+            all_events.extend(parser.feed_line(line));
+        }
+        all_events.extend(parser.flush());
+
+        // Must NOT emit BuildSuccess (deferred success should not fire)
+        assert!(
+            !all_events.iter().any(|e| matches!(e, BuildEvent::BuildSuccess)),
+            "BuildSuccess should not be emitted when errors follow"
+        );
+
+        // Must emit BuildFailed
+        assert!(
+            all_events.iter().any(|e| matches!(e, BuildEvent::BuildFailed)),
+            "BuildFailed must be emitted"
+        );
+
+        // Extract diagnostics
+        let diags: Vec<_> = all_events
+            .iter()
+            .filter_map(|e| match e {
+                BuildEvent::DiagnosticEmitted(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+
+        // Should have exactly 3 real errors (sentinels filtered)
+        assert_eq!(diags.len(), 3, "Expected 3 diagnostics, got {:?}", diags);
+
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("cannot find `sample_project`")));
+        assert!(messages.iter().any(|m| m.contains("unresolved_symbol_12345")));
+        assert!(messages.iter().any(|m| m.contains("mismatched types")));
+
+        // Sentinels must be filtered
+        assert!(
+            !messages.iter().any(|m| m.contains("Some errors have detailed")),
+            "sentinel lines should be filtered"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("For more information")),
+            "help lines should be filtered"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("could not compile")),
+            "cargo summary line should be filtered"
         );
     }
 }

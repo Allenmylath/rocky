@@ -206,6 +206,17 @@ impl ChatMessage {
             timestamp: now_ms(),
         }
     }
+
+    pub fn fatal_error(msg: impl Into<String>) -> Self {
+        Self {
+            id: now_ms(),
+            role: MessageRole::System,
+            content: msg.into(),
+            tool_calls: vec![],
+            triggered_by: None,
+            timestamp: now_ms(),
+        }
+    }
 }
 
 // ── ChatState ─────────────────────────────────────────────────────────────────

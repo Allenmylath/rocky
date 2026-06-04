@@ -9,7 +9,7 @@ use dioxus::prelude::*;
 
 #[component]
 pub fn Root() -> Element {
-    let session = use_context::<Signal<SessionState>>();
+    let mut session = use_context::<Signal<SessionState>>();
     let chat = use_context::<Signal<ChatState>>();
     let config_signal = use_context::<Signal<ProviderConfig>>();
 
@@ -18,9 +18,15 @@ pub fn Root() -> Element {
         if let Some(project_path) = path {
             let config = config_signal.read().clone();
             spawn(async move {
-                crate::app::start_project(project_path, session, chat, config).await;
+                crate::app::start_project(project_path, session, chat, config, false).await;
             });
         }
+    };
+
+    let on_leave_sample = move |_| {
+        session.write().project_path = None;
+        session.write().is_sample_project = false;
+        session.write().serve_running = false;
     };
 
     rsx! {
@@ -59,6 +65,36 @@ pub fn Root() -> Element {
                             onclick: on_restart,
                             "▶ Start dx serve"
                         }
+                    }
+                }
+            }
+
+            if session.read().is_sample_project {
+                div {
+                    style: "
+                        padding: 6px 16px;
+                        background: #1a2a1a;
+                        color: #4ade80;
+                        font-size: 12px;
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        border-bottom: 1px solid #2a4a2a;
+                    ",
+                    span { "🎓 Sample project — verify the build works, then open your own project." }
+                    button {
+                        style: "
+                            background: transparent;
+                            border: 1px solid #4ade80;
+                            color: #4ade80;
+                            padding: 2px 10px;
+                            border-radius: 4px;
+                            font-family: monospace;
+                            font-size: 11px;
+                            cursor: pointer;
+                        ",
+                        onclick: on_leave_sample,
+                        "Open real project →"
                     }
                 }
             }

@@ -1,4 +1,4 @@
-use crate::serve::events::RustcDiagnostic;
+use crate::serve::events::{BuildStage, RustcDiagnostic};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +53,14 @@ pub struct SessionState {
     pub fatal_fix_iterations: u8,
     /// Raw lines from dx serve — last 200 kept for the log panel
     pub raw_log: Vec<String>,
+    /// True when the currently open project is the built-in sample project.
+    /// Used to show a "sample mode" banner and to know when the user has
+    /// moved on to a real project.
+    pub is_sample_project: bool,
+    /// Current build stage for UI progress display
+    pub build_stage: Option<BuildStage>,
+    /// Which crate is currently being compiled
+    pub current_compiling_crate: Option<String>,
 }
 
 pub const AUTO_FIX_COUNTDOWN_SECS: u8 = 5;
@@ -67,6 +75,9 @@ impl Default for SessionState {
             auto_fix_iterations: 0,
             fatal_fix_iterations: 0,
             raw_log: Vec::new(),
+            is_sample_project: false,
+            build_stage: None,
+            current_compiling_crate: None,
         }
     }
 }
@@ -82,6 +93,16 @@ impl SessionState {
     pub fn on_build_started(&mut self) {
         self.build_status = BuildStatus::Building;
         self.auto_fix = AutoFixState::Idle;
+        self.build_stage = Some(BuildStage::Initializing);
+        self.current_compiling_crate = None;
+    }
+
+    pub fn on_progress(&mut self, stage: BuildStage) {
+        self.build_stage = Some(stage);
+    }
+
+    pub fn on_compiling_crate(&mut self, krate: String) {
+        self.current_compiling_crate = Some(krate);
     }
 
     pub fn on_build_success(&mut self) {

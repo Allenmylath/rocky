@@ -3,6 +3,7 @@ pub mod tools;
 
 use rig_core::providers::{anthropic, openai};
 use rig_core::completion::{Chat, Message, Prompt};
+use rig_core::client::CompletionClient;
 
 /// Which LLM provider to use via Rig.
 #[derive(Clone, Debug)]
@@ -53,7 +54,7 @@ impl RigAgent {
     pub async fn prompt(&self, text: &str) -> anyhow::Result<String> {
         match &self.backend {
             RigBackend::OpenAi(key) => {
-                let client = openai::Client::new(key);
+                let client = openai::Client::new(key)?;
                 let agent = client
                     .agent(&self.model)
                     .preamble(&self.preamble)
@@ -61,7 +62,7 @@ impl RigAgent {
                 Ok(agent.prompt(text).await?)
             }
             RigBackend::Anthropic(key) => {
-                let client = anthropic::Client::new(key);
+                let client = anthropic::Client::new(key)?;
                 let agent = client
                     .agent(&self.model)
                     .preamble(&self.preamble)
@@ -73,23 +74,23 @@ impl RigAgent {
 
     /// Chat with history. `history` should contain previous turns.
     /// The new `prompt` is the latest user message.
-    pub async fn chat(&self, prompt: &str, history: Vec<Message>) -> anyhow::Result<String> {
+    pub async fn chat(&self, prompt: &str, mut history: Vec<Message>) -> anyhow::Result<String> {
         match &self.backend {
             RigBackend::OpenAi(key) => {
-                let client = openai::Client::new(key);
+                let client = openai::Client::new(key)?;
                 let agent = client
                     .agent(&self.model)
                     .preamble(&self.preamble)
                     .build();
-                Ok(agent.chat(prompt, history).await?)
+                Ok(agent.chat(prompt, &mut history).await?)
             }
             RigBackend::Anthropic(key) => {
-                let client = anthropic::Client::new(key);
+                let client = anthropic::Client::new(key)?;
                 let agent = client
                     .agent(&self.model)
                     .preamble(&self.preamble)
                     .build();
-                Ok(agent.chat(prompt, history).await?)
+                Ok(agent.chat(prompt, &mut history).await?)
             }
         }
     }
@@ -125,7 +126,7 @@ impl ToolAgent {
     pub async fn prompt(&self, text: &str) -> anyhow::Result<String> {
         match &self.backend {
             RigBackend::OpenAi(key) => {
-                let client = openai::Client::new(key);
+                let client = openai::Client::new(key)?;
                 let agent = client
                     .agent(&self.model)
                     .preamble(&self.preamble)
@@ -145,7 +146,7 @@ impl ToolAgent {
                 Ok(agent.prompt(text).await?)
             }
             RigBackend::Anthropic(key) => {
-                let client = anthropic::Client::new(key);
+                let client = anthropic::Client::new(key)?;
                 let agent = client
                     .agent(&self.model)
                     .preamble(&self.preamble)

@@ -1,8 +1,9 @@
 use crate::agent::client::{ModelClient, ProviderConfig};
 use crate::agent::context::ConversationContext;
 use crate::agent::loop_runner::{run_turn, AgentEvent};
-use crate::serve::events::BuildEvent;
+use crate::serve::events::{BuildEvent, BuildStage};
 use crate::serve::process::ServeHandle;
+use crate::fs::read::read_files_parallel;
 use crate::state::chat::{ChatMessage, ChatState, StepKind, StepStatus, WorkflowStep};
 use crate::state::session::SessionState;
 use crate::ui::root::Root;
@@ -36,7 +37,7 @@ pub fn App() -> Element {
         let config = config_sig.read().clone();
         spawn(async move {
             if let Some(path) = crate::config::load_last_project() {
-                start_project(path, session, chat, config).await;
+                start_project(path, session, chat, config, false).await;
             }
         });
     });
@@ -51,11 +52,15 @@ pub async fn start_project(
     mut session: Signal<SessionState>,
     mut chat: Signal<ChatState>,
     config: ProviderConfig,
+    is_sample: bool,
 ) {
     session.write().project_path = Some(project_path.clone());
     session.write().serve_running = true;
+    session.write().is_sample_project = is_sample;
 
-    crate::config::save_last_project(&project_path);
+    if !is_sample {
+        crate::config::save_last_project(&project_path);
+    }
 
     chat.write().push(ChatMessage::system(format!(
         "Opened project: {}",
@@ -224,8 +229,20 @@ fn spawn_build_event_loop(
                     session.write().push_log(line);
                 }
 
-                BuildEvent::FatalError(_msg) => {
+                BuildEvent::Progress { stage } => {
+                    session.write().on_progress(stage.clone());
+                    tracing::debug!("Build progress: {:?}", stage);
+                }
+
+                BuildEvent::CompilingCrate { krate } => {
+                    session.write().on_compiling_crate(krate.clone());
+                    tracing::debug!("Compiling crate: {}", krate);
+                }
+
+                BuildEvent::FatalError(msg) => {
                     had_startup_failure = true;
+                    chat.write().push(ChatMessage::fatal_error(&msg));
+                    tracing::error!("Fatal error from dx serve: {}", msg);
                 }
             }
         }
@@ -299,6 +316,18 @@ async fn spawn_agent_turn(
         }
     }
 
+    // Inject full source of error-bearing files so the LLM has context
+    let diag_files: Vec<String> = diagnostics
+        .iter()
+        .map(|d| d.file.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let file_contents = read_files_parallel(&project_path, &diag_files).await;
+    for (path, content) in file_contents {
+        context.push_file_context(&path, content);
+    }
+
     let touched_files = chat.read().last_touched_files.clone();
     let fix_message = ConversationContext::build_auto_fix_message(&diagnostics, &touched_files);
     context.push_user(&fix_message);
@@ -323,8 +352,8 @@ async fn spawn_agent_turn(
 
             AgentEvent::ActionStarted(name, summary) => {
                 let kind = match name.as_str() {
-                    "read_file" => StepKind::ReadFile,
-                    "write_file" => StepKind::WriteFile,
+                    "read_file" | "read_files" => StepKind::ReadFile,
+                    "write_file" | "write_files" => StepKind::WriteFile,
                     "list_files" => StepKind::ListFiles,
                     _ => StepKind::Build,
                 };
@@ -467,7 +496,7 @@ fn spawn_fatal_fix_turn(
             )));
             // Brief pause so file writes settle before cargo reads them
             tokio::time::sleep(Duration::from_millis(500)).await;
-            start_project(project_path, session, chat, config).await;
+            start_project(project_path, session, chat, config, false).await;
         }
     });
 }
