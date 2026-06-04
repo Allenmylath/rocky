@@ -6,7 +6,7 @@ use crate::serve::process::ServeHandle;
 use crate::state::chat::{ChatMessage, ChatState, StepKind, StepStatus, WorkflowStep};
 use crate::state::session::SessionState;
 use crate::ui::root::Root;
-use dioxus::desktop::{Config, WindowBuilder};
+use dioxus::desktop::{use_window, Config, WindowBuilder};
 use dioxus::prelude::*;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,6 +26,11 @@ pub fn App() -> Element {
     let session = use_context_provider(|| Signal::new(SessionState::default()));
     let chat = use_context_provider(|| Signal::new(ChatState::default()));
     let config_sig = use_context_provider(|| Signal::new(ProviderConfig::default()));
+    let win = use_window();
+
+    use_effect(move || {
+        win.set_maximized(true);
+    });
 
     use_effect(move || {
         let config = config_sig.read().clone();
@@ -376,7 +381,6 @@ fn strip_ansi_for_prompt(s: &str) -> String {
 
 // ── Fatal error fix turn ──────────────────────────────────────────────────────
 
-const MAX_FATAL_FIX_ITERATIONS: u8 = 4;
 
 fn spawn_fatal_fix_turn(
     mut session: Signal<SessionState>,
@@ -453,21 +457,17 @@ fn spawn_fatal_fix_turn(
 
         // If the agent wrote files, restart dx serve to verify the fix.
         // The new run will trigger another fatal-fix turn if it fails again.
-        let iterations = session.read().fatal_fix_iterations;
-        if files_written && iterations < MAX_FATAL_FIX_ITERATIONS {
+        // Loops indefinitely until the build succeeds.
+        if files_written {
+            let iterations = session.read().fatal_fix_iterations;
             session.write().fatal_fix_iterations += 1;
             chat.write().push(ChatMessage::system(format!(
-                "Restarting dx serve (attempt {}/{})...",
+                "Restarting dx serve (attempt {})...",
                 iterations + 1,
-                MAX_FATAL_FIX_ITERATIONS
             )));
             // Brief pause so file writes settle before cargo reads them
             tokio::time::sleep(Duration::from_millis(500)).await;
             start_project(project_path, session, chat, config).await;
-        } else if files_written {
-            chat.write().push(ChatMessage::system(
-                "Max auto-fix attempts reached. Use ▶ Start dx serve to retry manually.".to_string(),
-            ));
         }
     });
 }

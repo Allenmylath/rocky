@@ -55,7 +55,6 @@ pub struct SessionState {
     pub raw_log: Vec<String>,
 }
 
-pub const MAX_AUTO_FIX_ITERATIONS: u8 = 5;
 pub const AUTO_FIX_COUNTDOWN_SECS: u8 = 5;
 
 impl Default for SessionState {
@@ -94,9 +93,7 @@ impl SessionState {
 
     pub fn on_build_failed(&mut self, diagnostics: Vec<RustcDiagnostic>) {
         self.build_status = BuildStatus::Failed(diagnostics);
-        if self.auto_fix_iterations < MAX_AUTO_FIX_ITERATIONS {
-            self.auto_fix = AutoFixState::Countdown(AUTO_FIX_COUNTDOWN_SECS);
-        }
+        self.auto_fix = AutoFixState::Countdown(AUTO_FIX_COUNTDOWN_SECS);
     }
 
     pub fn stop_auto_fix(&mut self) {

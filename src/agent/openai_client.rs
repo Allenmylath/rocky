@@ -3,7 +3,7 @@ use crate::agent::tools::tool_definitions;
 use anyhow::Result;
 use serde_json::{json, Value};
 
-pub const OPENAI_MODEL: &str = "gpt-4o";
+pub const OPENAI_MODEL: &str = "o4-mini";
 pub const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 
 pub struct OpenAiClient {
@@ -29,7 +29,7 @@ impl OpenAiClient {
 
         let body = json!({
             "model": OPENAI_MODEL,
-            "max_tokens": 8192,
+            "max_completion_tokens": 8192,
             "messages": messages,
             "tools": openai_tool_definitions(),
             "tool_choice": "auto",
