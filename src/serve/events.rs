@@ -59,28 +59,35 @@ impl RustcDiagnostic {
             .as_deref()
             .map(|c| format!("[{}] ", c))
             .unwrap_or_default();
-        format!(
-            "{}:{}: {}{}",
-            self.file, self.line, code, self.message
-        )
+        if self.file.is_empty() {
+            format!("{}{}", code, self.message)
+        } else {
+            format!(
+                "{}:{}: {}{}",
+                self.file, self.line, code, self.message
+            )
+        }
     }
 
     /// Full block including snippet — used in auto-fix prompt
     pub fn to_prompt_block(&self) -> String {
-        let mut out = format!(
-            "{} --> {}:{}:{}\n",
-            match self.level {
-                DiagnosticLevel::Error => "error",
-                DiagnosticLevel::Warning => "warning",
-                DiagnosticLevel::Note => "note",
-            },
-            self.file,
-            self.line,
-            self.col,
-        );
-        if let Some(code) = &self.code {
-            out = format!("error[{}]{}", code, out.trim_start_matches("error"));
-        }
+        let level_str = match self.level {
+            DiagnosticLevel::Error => "error",
+            DiagnosticLevel::Warning => "warning",
+            DiagnosticLevel::Note => "note",
+        };
+        let mut out = if self.file.is_empty() {
+            format!("{}: {}\n", level_str, self.message)
+        } else {
+            let mut loc = format!(
+                "{} --> {}:{}:{}\n",
+                level_str, self.file, self.line, self.col,
+            );
+            if let Some(code) = &self.code {
+                loc = format!("error[{}]{}", code, loc.trim_start_matches("error"));
+            }
+            loc
+        };
         if !self.snippet.is_empty() {
             out.push_str("```\n");
             for line in &self.snippet {

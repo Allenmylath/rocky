@@ -319,6 +319,7 @@ async fn spawn_agent_turn(
     // Inject full source of error-bearing files so the LLM has context
     let diag_files: Vec<String> = diagnostics
         .iter()
+        .filter(|d| !d.file.is_empty())
         .map(|d| d.file.clone())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
