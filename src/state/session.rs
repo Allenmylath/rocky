@@ -1,5 +1,42 @@
 use crate::serve::events::{BuildStage, RustcDiagnostic};
+use crate::serve::process::ServeHandle;
+use crate::templates::TemplateKind;
 use std::path::PathBuf;
+
+/// Lifecycle of the background warm project.
+pub enum WarmState {
+    Idle,
+    Warming,
+    Ready {
+        project_path: PathBuf,
+        serve_handle: ServeHandle,
+    },
+    Taken,
+}
+
+impl std::fmt::Debug for WarmState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WarmState::Idle => write!(f, "Idle"),
+            WarmState::Warming => write!(f, "Warming"),
+            WarmState::Ready { project_path, .. } => {
+                write!(f, "Ready({})", project_path.display())
+            }
+            WarmState::Taken => write!(f, "Taken"),
+        }
+    }
+}
+
+impl Clone for WarmState {
+    fn clone(&self) -> Self {
+        match self {
+            WarmState::Idle => WarmState::Idle,
+            WarmState::Warming => WarmState::Warming,
+            WarmState::Ready { .. } => WarmState::Warming,
+            WarmState::Taken => WarmState::Taken,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuildTarget {
@@ -42,7 +79,7 @@ pub enum AutoFixState {
     Stopped,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SessionState {
     pub project_path: Option<PathBuf>,
     pub build_status: BuildStatus,
@@ -54,13 +91,17 @@ pub struct SessionState {
     /// Raw lines from dx serve — last 200 kept for the log panel
     pub raw_log: Vec<String>,
     /// True when the currently open project is the built-in sample project.
-    /// Used to show a "sample mode" banner and to know when the user has
-    /// moved on to a real project.
     pub is_sample_project: bool,
     /// Current build stage for UI progress display
     pub build_stage: Option<BuildStage>,
     /// Which crate is currently being compiled
     pub current_compiling_crate: Option<String>,
+    /// Background warm project state
+    pub warm_state: WarmState,
+    /// Initial user prompt when creating from a template
+    pub initial_prompt: Option<String>,
+    /// Which template was selected for the current project
+    pub template_kind: Option<TemplateKind>,
 }
 
 pub const AUTO_FIX_COUNTDOWN_SECS: u8 = 5;
@@ -78,6 +119,9 @@ impl Default for SessionState {
             is_sample_project: false,
             build_stage: None,
             current_compiling_crate: None,
+            warm_state: WarmState::Idle,
+            initial_prompt: None,
+            template_kind: None,
         }
     }
 }

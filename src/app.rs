@@ -1,7 +1,7 @@
 use crate::agent::client::{ModelClient, ProviderConfig};
 use crate::agent::context::ConversationContext;
 use crate::agent::loop_runner::{run_turn, AgentEvent};
-use crate::serve::events::{BuildEvent, BuildStage};
+use crate::serve::events::BuildEvent;
 use crate::serve::process::ServeHandle;
 use crate::fs::read::read_files_parallel;
 use crate::state::chat::{ChatMessage, ChatState, StepKind, StepStatus, WorkflowStep};
@@ -25,20 +25,20 @@ pub fn run() {
 #[component]
 pub fn App() -> Element {
     let session = use_context_provider(|| Signal::new(SessionState::default()));
-    let chat = use_context_provider(|| Signal::new(ChatState::default()));
-    let config_sig = use_context_provider(|| Signal::new(ProviderConfig::default()));
+    let _chat = use_context_provider(|| Signal::new(ChatState::default()));
+    let _config_sig = use_context_provider(|| Signal::new(ProviderConfig::default()));
     let win = use_window();
 
     use_effect(move || {
         win.set_maximized(true);
     });
 
+    // Start warming a blank template in the background so the next project
+    // creation is instant.
     use_effect(move || {
-        let config = config_sig.read().clone();
+        let session = session.clone();
         spawn(async move {
-            if let Some(path) = crate::config::load_last_project() {
-                start_project(path, session, chat, config, false).await;
-            }
+            crate::templates::warmstart::start_warm_build(session).await;
         });
     });
 
@@ -54,6 +54,14 @@ pub async fn start_project(
     config: ProviderConfig,
     is_sample: bool,
 ) {
+    // If a warm build is still running on port 8080, kill it so the new
+    // project can bind the port.
+    if let crate::state::session::WarmState::Ready { serve_handle, .. } =
+        std::mem::replace(&mut session.write().warm_state, crate::state::session::WarmState::Idle)
+    {
+        serve_handle.kill();
+    }
+
     session.write().project_path = Some(project_path.clone());
     session.write().serve_running = true;
     session.write().is_sample_project = is_sample;
@@ -143,6 +151,21 @@ fn spawn_build_event_loop(
                         if let Err(e) = open::that_detached("http://localhost:8080") {
                             tracing::warn!("Failed to open browser: {}", e);
                         }
+                    }
+
+                    // If this project was created from a template with an initial
+                    // user description, kick off the first agent turn immediately.
+                    let prompt = session.write().initial_prompt.take();
+                    let template_kind = session.read().template_kind.clone();
+                    if let Some(prompt) = prompt {
+                        spawn_template_turn(
+                            session,
+                            chat.clone(),
+                            config.clone(),
+                            project_path.clone(),
+                            prompt,
+                            template_kind,
+                        );
                     }
                 }
 
@@ -421,6 +444,131 @@ async fn spawn_agent_turn(
     }
 
     chat.write().agent_running = false;
+}
+
+// ── Template turn ────────────────────────────────────────────────────────────
+
+/// Spawn an agent turn for a project created from a template.
+/// Instead of diagnostics, the agent receives the user's initial description
+/// and a system context telling it to read existing files first, then edit.
+fn spawn_template_turn(
+    _session: Signal<SessionState>,
+    mut chat: Signal<ChatState>,
+    config: ProviderConfig,
+    project_path: PathBuf,
+    prompt: String,
+    template_kind: Option<crate::templates::TemplateKind>,
+) {
+    spawn(async move {
+        chat.write().agent_running = true;
+        chat.write().begin_turn("template → editing");
+
+        let client = ModelClient::new(&config);
+        let mut context = ConversationContext::default();
+
+        // Replay existing chat history into the agent context
+        {
+            let chat_read = chat.read();
+            for msg in chat_read.to_api_messages() {
+                match msg.role.as_str() {
+                    "user" => context.push_user(msg.content),
+                    "assistant" => context.push_assistant_text(msg.content),
+                    _ => {}
+                }
+            }
+        }
+
+        // List files so the agent knows the entrypoints
+        let files = crate::fs::list::list_src_files(&project_path).await.unwrap_or_default();
+        let file_list = files.join("\n");
+        context.push_user(format!(
+            "Files present in project:\n```\n{}\n```",
+            file_list
+        ));
+
+        // Inject entrypoint file contents for immediate context
+        let entrypoints: Vec<String> = files
+            .into_iter()
+            .filter(|f| f == "src/main.rs" || f == "Cargo.toml" || f.ends_with("/mod.rs"))
+            .collect();
+        let file_contents = read_files_parallel(&project_path, &entrypoints).await;
+        for (path, content) in file_contents {
+            context.push_file_context(&path, content);
+        }
+
+        let template_name = template_kind
+            .map(|k| k.display_name().to_string())
+            .unwrap_or_else(|| "Blank".to_string());
+
+        let system_msg = format!(
+            "You are editing the {} template.\n\
+             The project compiles successfully.\n\
+             Read the existing files first, then transform the template to match the request.\n\
+             Do not scaffold from scratch — build on what exists.\n\n\
+             The user wants: {}",
+            template_name, prompt
+        );
+
+        context.push_user(system_msg);
+        chat.write().push(ChatMessage::user(prompt));
+
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel(64);
+
+        spawn(async move {
+            if let Err(e) = run_turn(&client, &mut context, project_path, agent_tx).await {
+                tracing::error!("Template turn failed: {}", e);
+            }
+        });
+
+        let mut assistant_text = String::new();
+        let mut tool_calls = vec![];
+
+        while let Some(event) = agent_rx.recv().await {
+            match event {
+                AgentEvent::AssistantText(text) => {
+                    assistant_text.push_str(&text);
+                }
+
+                AgentEvent::ActionStarted(name, summary) => {
+                    let kind = match name.as_str() {
+                        "read_file" | "read_files" => StepKind::ReadFile,
+                        "write_file" | "write_files" => StepKind::WriteFile,
+                        "list_files" => StepKind::ListFiles,
+                        _ => StepKind::Build,
+                    };
+                    chat.write().push_step(WorkflowStep::new(kind, summary));
+                }
+
+                AgentEvent::ToolCalled(tc) => {
+                    chat.write().complete_last_step();
+                    tool_calls.push(tc);
+                }
+
+                AgentEvent::FileWritten(path) => {
+                    chat.write().last_touched_files.push(path.clone());
+                }
+
+                AgentEvent::TurnComplete => {
+                    if !assistant_text.is_empty() || !tool_calls.is_empty() {
+                        chat.write().push(ChatMessage::assistant(
+                            assistant_text.clone(),
+                            tool_calls.clone(),
+                        ));
+                    }
+                    chat.write().finish_turn(StepStatus::Complete);
+                    break;
+                }
+
+                AgentEvent::Error(e) => {
+                    chat.write().push(ChatMessage::system(format!("Agent error: {}", e)));
+                    chat.write().finish_turn(StepStatus::Failed);
+                    break;
+                }
+            }
+        }
+
+        chat.write().agent_running = false;
+    });
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@ use crate::state::chat::ChatState;
 use crate::state::session::SessionState;
 use crate::ui::chat::ChatPanel;
 use crate::ui::diagnostics::BuildLogPanel;
-use crate::ui::project_picker::ProjectPicker;
+use crate::ui::template_picker::TemplatePicker;
 use crate::ui::workflow::WorkflowPanel;
 use dioxus::prelude::*;
 
@@ -102,7 +102,7 @@ pub fn Root() -> Element {
             if session.read().project_path.is_none() {
                 div {
                     style: "flex: 1; display: flex; align-items: center; justify-content: center;",
-                    ProjectPicker {}
+                    TemplatePicker {}
                 }
             } else {
                 div {

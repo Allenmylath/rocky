@@ -5,6 +5,7 @@ mod fs;
 mod sample_project;
 mod serve;
 mod state;
+mod templates;
 mod ui;
 
 fn main() {
