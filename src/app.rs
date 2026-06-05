@@ -170,14 +170,45 @@ fn spawn_build_event_loop(
 
                     if count > 0 {
                         had_startup_failure = false;
-                        session.write().on_build_failed(diags.clone());
-                        chat.write().push(ChatMessage::auto_fix(diags.clone()));
+
+                        // If any diagnostic lacks file/line context, fall back to
+                        // `cargo check` which emits the standard rustc format.
+                        let enriched = if diags.iter().any(|d| d.file.is_empty()) {
+                            match crate::serve::cargo_check::run(&project_path).await {
+                                Ok(cargo_diags) if !cargo_diags.is_empty() => {
+                                    tracing::info!(
+                                        "Enriched {} vague dx errors into {} cargo diagnostics",
+                                        count,
+                                        cargo_diags.len()
+                                    );
+                                    cargo_diags
+                                }
+                                Ok(_) => {
+                                    tracing::warn!(
+                                        "cargo check returned no diagnostics; keeping vague dx errors"
+                                    );
+                                    diags.clone()
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "cargo check fallback failed: {}. Keeping vague dx errors.",
+                                        e
+                                    );
+                                    diags.clone()
+                                }
+                            }
+                        } else {
+                            diags.clone()
+                        };
+
+                        session.write().on_build_failed(enriched.clone());
+                        chat.write().push(ChatMessage::auto_fix(enriched.clone()));
                         spawn_countdown_loop(
                             session,
                             chat.clone(),
                             config.clone(),
                             project_path.clone(),
-                            diags,
+                            enriched,
                         );
                     }
                 }

@@ -99,6 +99,11 @@ Receives `BuildEvent` from `dx serve`:
 - `BuildSuccess` → completes turn, opens browser on first success
 - `DiagnosticEmitted(diag)` → collects errors
 - `BuildFailed` → completes turn, triggers auto-fix agent turn after countdown
+  - **Cargo-check fallback**: If the parsed diagnostics lack file/line info (dx
+    only emitted vague Format A error lines), Rocky automatically runs
+    `cargo check` in the project directory and swaps in the full rustc
+    diagnostics with `--> file:line:col` locations and snippets before
+    sending them to the LLM.
 - `ProcessExited { code }` → if fatal startup failure, feeds raw log to agent
 
 ### 3. Agent Turn (`agent/loop_runner.rs`)
